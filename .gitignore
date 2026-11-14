@@ -1,0 +1,10 @@
+.venv_gemini_subtitle/
+__pycache__/
+*.pyc
+build/
+dist/
+dmg_staging/
+build_bin/
+*.dmg
+*.sha256
+.DS_Store
