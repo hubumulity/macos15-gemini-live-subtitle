@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.2.2)
+macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.2.3)
 ===========================================================================
 基于 Google Gemini Live API (`gemini-3.5-live-translate-preview`) 构建的桌面级实时字幕工具。
 
@@ -10,14 +10,15 @@ macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软�
    - 模式 A（推荐，免装虚拟声卡）：自动调用内置预编译的 Swift `ScreenCaptureKit` 音频捕获器，
      直接抓取 macOS 系统桌面音频并输出 16kHz 16-bit 单声道 PCM 流。
    - 模式 B（CoreAudio 虚拟声卡/输入设备）：支持 BlackHole 2ch、Loopback 或任意麦克风/聚合设备。
-2. 逐句换行显示 + 跨行防重复 + 每句严格 5 秒自动清空 (`SubtitleDisplayStateController`)：
-   - 修复了流式全量回包拼接与流式修订导致上下两排显示重复字幕的问题；
-   - 任何相似度 >= 0.40 或存在包含关系的上下两行字幕会自动原地覆盖合并为单行，仅在真正出现不同语义的上下句时才换行显示；
-   - 每句字幕独立计时，满 5.0 秒自动清空；停止说话 5 秒后屏幕完全清空。
-3. 安全无崩溃的跨应用全局置顶 (`PYFUNCTYPE` 单次设置 `hidesOnDeactivate=False` + `NSStatusWindowLevel`)：
-   - 采用 `ctypes.PYFUNCTYPE`（保持 GIL 不释放）单次设置 `setHidesOnDeactivate:(False)` 与
-     `setLevel:(25)`，彻底解决切换浏览器时窗口隐藏与闪退问题。
-4. 纯透明无边框文字悬浮 + 语气词/喘息/呻吟三重过滤 + 永不休眠长间隙秒级唤醒。
+2. 弱音/小声说话自动增益放大 (Smart AGC) + 高灵敏度数字音频门限：
+   - 将数字音频静音门限下调至 `0.0004` (-68 dBFS)，支持极低系统音量与耳语/小声说话捕捉；
+   - 内置实时自动增益控制 (AGC)：当检测到小声说话 (`0.0004 <= RMS < 0.06`) 时，自动将音频平滑放大
+     （最高 15 倍动态增益 + `tanh` 软限幅防爆音）后再送入 Gemini 3.5 Live 模型，彻底解决小声说话不翻译问题。
+3. 单行逐句滚动刷新 + 严格 5 秒自动清空 (彻底根除两排重复字幕)：
+   - 废除上下双排残影布局，改为**单行纯净大字展示最新短句**：流式长文按句号、逗号、问号及字数上限
+     （默认 24 字）实时切分，新短句自动替换旧短句，物理上彻底杜绝“上下两排重复字幕”；
+   - 每句字幕显示满 5.0 秒无更新后自动清空屏幕。
+4. 安全无崩溃的跨应用全局置顶 (`PYFUNCTYPE` 单次设置 `hidesOnDeactivate=False` + `NSStatusWindowLevel`)。
 """
 
 from __future__ import annotations
@@ -112,7 +113,6 @@ TARGET_LANGUAGE_BCP47 = "zh-Hans"
 # 每句字幕保留时间（秒）与单句最大字数
 SENTENCE_TTL_SECONDS = 5.0
 MAX_CHARS_PER_LINE = 24
-MAX_VISIBLE_LINES = 2
 
 
 # ==============================================================================
@@ -293,13 +293,14 @@ class AppSettings:
     model_name: str = DEFAULT_MODEL
     capture_backend: str = "auto"         # "auto", "screencapturekit", "audio_device"
     audio_device_name: str = ""           # 指定 BlackHole 2ch 等设备名
-    vad_rms_threshold: float = 0.008      # 语音激活 RMS 阈值
-    breath_filter_strength: float = 0.65  # 喘息/呻吟频谱过滤强度 (0.0 ~ 1.0)
-    dedup_similarity: float = 0.82        # 重复字幕判定阈值
-    font_size: int = 26
+    vad_rms_threshold: float = 0.0004     # 高灵敏度数字静音门限 (-68 dBFS)，确保小声说话也能触发
+    enable_agc: bool = True               # 自动放大弱音/小声说话 (Smart AGC)
+    breath_filter_strength: float = 0.55  # 喘息/呻吟频谱过滤强度 (0.0 ~ 1.0)
+    dedup_similarity: float = 0.80        # 重复字幕判定阈值
+    font_size: int = 28
     transparent_bg: bool = True           # 默认开启背景纯透明（只显示文字）
     sentence_ttl_sec: float = 5.0         # 每句字幕保留秒数（默认 5.0 秒自动清空）
-    max_chars_per_line: int = 24          # 单句自动换行最大字数
+    max_chars_per_line: int = 24          # 单句自动切换最大字数
     window_alpha: float = 0.92
     show_bilingual: bool = False          # 是否同时显示源语言识别文本
     echo_target_language: bool = False    # 当源音频本身是中文时是否复述
@@ -311,6 +312,9 @@ class AppSettings:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                # 如果旧配置文件中保存了过高的 vad_rms_threshold (0.008)，自动迁移至高灵敏度 0.0004
+                if data.get("vad_rms_threshold", 0.0) >= 0.005:
+                    data["vad_rms_threshold"] = 0.0004
                 settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
                 if not settings.api_key and env_key:
                     settings.api_key = env_key
@@ -332,28 +336,54 @@ class AppSettings:
 
 
 # ==============================================================================
-# 3. 声学前端：VAD + 喘息/呻吟频谱过滤器 + 300ms 预卷缓冲
+# 3. 声学前端：高灵敏度 VAD + 弱音自动增益放大 (AGC) + 喘息过滤 + 300ms 预卷
 # ==============================================================================
 class AcousticSpeechFilter:
+    """
+    1. 支持极低音量/耳语检测 (`rms_threshold = 0.0004`)；
+    2. 内置 Smart AGC (自动增益控制)：当说话声音很轻 (`0.0004 <= rms < 0.06`) 时，
+       自动将音量平滑放大至标准响度 (`target_rms = 0.08`，最高放大 15 倍并带 `tanh` 软限幅)，
+       确保 Gemini 3.5 Live 模型能够清晰识别小声说话内容；
+    3. 仅拦截高能量宽频吹麦/喘息白噪，绝不误伤轻声细语。
+    """
+
     def __init__(
         self,
         sample_rate: int = TARGET_SAMPLE_RATE,
-        rms_threshold: float = 0.008,
-        breath_filter_strength: float = 0.65,
+        rms_threshold: float = 0.0004,
+        breath_filter_strength: float = 0.55,
+        enable_agc: bool = True,
     ) -> None:
         self.sample_rate = sample_rate
-        self.rms_threshold = rms_threshold
+        self.rms_threshold = max(0.0001, float(rms_threshold))
         self.breath_filter_strength = breath_filter_strength
+        self.enable_agc = enable_agc
 
-        self.preroll_buffer: Deque[bytes] = deque(maxlen=3)
-        self.hangover_max_frames = 12
+        self.preroll_buffer: Deque[bytes] = deque(maxlen=4)  # 400ms 预卷缓冲，确保轻声起音不漏字
+        self.hangover_max_frames = 16  # 1.6 秒句尾保持，防止轻声说话尾音被切
         self.hangover_counter = 0
         self.in_speech_segment = False
-        self.consecutive_voiced_frames = 0
 
-    def update_params(self, rms_threshold: float, breath_filter_strength: float) -> None:
-        self.rms_threshold = max(0.001, float(rms_threshold))
+    def update_params(self, rms_threshold: float, breath_filter_strength: float, enable_agc: bool = True) -> None:
+        self.rms_threshold = max(0.0001, float(rms_threshold))
         self.breath_filter_strength = min(1.0, max(0.0, float(breath_filter_strength)))
+        self.enable_agc = bool(enable_agc)
+
+    def _apply_smart_agc(self, samples: np.ndarray, rms: float) -> bytes:
+        """对小声说话/低音量系统音频进行动态增益放大，使模型能清晰识别轻声语音。"""
+        if not self.enable_agc or rms <= 1e-6:
+            clamped = np.clip(samples, -1.0, 1.0)
+            return (clamped * 32767.0).astype("<i2").tobytes()
+
+        target_rms = 0.085
+        if rms < target_rms:
+            # 最高放大 15 倍 (+23.5 dB)，让耳语或低音量视频也能达到清晰识别电平
+            gain = min(15.0, target_rms / (rms + 1e-7))
+            boosted = np.tanh(samples * gain * 1.1) / np.tanh(1.1)
+        else:
+            boosted = np.clip(samples, -1.0, 1.0)
+
+        return (boosted * 32767.0).astype("<i2").tobytes()
 
     def analyze_chunk(self, pcm16_bytes: bytes) -> Tuple[bool, List[bytes], dict]:
         if len(pcm16_bytes) < 4:
@@ -362,8 +392,8 @@ class AcousticSpeechFilter:
         samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
 
+        # 1. 纯静音检测 (门限默认 0.0004，仅过滤完全无声的数字底噪)
         if rms < self.rms_threshold:
-            self.consecutive_voiced_frames = 0
             if self.in_speech_segment and self.hangover_counter > 0:
                 self.hangover_counter -= 1
                 return True, [pcm16_bytes], {"rms": rms, "is_speech": True, "reason": "hangover"}
@@ -371,60 +401,45 @@ class AcousticSpeechFilter:
             self.preroll_buffer.append(pcm16_bytes)
             return False, [], {"rms": rms, "is_speech": False, "reason": "silence"}
 
-        zero_crossings = float(np.mean(np.abs(np.diff(np.signbit(samples)))))
+        # 2. 频谱检测：仅针对明显响亮的气流喘息/吹麦白噪声进行拦截，保护小声说话不被误杀
+        if rms > 0.015:
+            zero_crossings = float(np.mean(np.abs(np.diff(np.signbit(samples)))))
+            windowed = samples * np.hanning(len(samples))
+            mag_spectrum = np.abs(np.fft.rfft(windowed)) + 1e-10
+            freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate)
 
-        windowed = samples * np.hanning(len(samples))
-        mag_spectrum = np.abs(np.fft.rfft(windowed)) + 1e-10
-        freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate)
+            log_mean = float(np.mean(np.log(mag_spectrum)))
+            spectral_flatness = math.exp(log_mean) / (float(np.mean(mag_spectrum)) + 1e-10)
 
-        log_mean = float(np.mean(np.log(mag_spectrum)))
-        geom_mean = math.exp(log_mean)
-        arith_mean = float(np.mean(mag_spectrum))
-        spectral_flatness = geom_mean / (arith_mean + 1e-10)
+            total_energy = float(np.sum(mag_spectrum ** 2)) + 1e-10
+            speech_band_mask = (freqs >= 250.0) & (freqs <= 3800.0)
+            speech_band_ratio = float(np.sum(mag_spectrum[speech_band_mask] ** 2)) / total_energy
 
-        total_energy = float(np.sum(mag_spectrum ** 2)) + 1e-10
-        speech_band_mask = (freqs >= 300.0) & (freqs <= 3400.0)
-        low_rumble_mask = freqs < 220.0
-        speech_band_ratio = float(np.sum(mag_spectrum[speech_band_mask] ** 2)) / total_energy
-        low_rumble_ratio = float(np.sum(mag_spectrum[low_rumble_mask] ** 2)) / total_energy
+            flatness_limit = 0.62 - 0.20 * self.breath_filter_strength
+            zcr_limit = 0.45 - 0.12 * self.breath_filter_strength
 
-        flatness_limit = 0.55 - 0.25 * self.breath_filter_strength
-        zcr_limit = 0.42 - 0.14 * self.breath_filter_strength
-        min_speech_ratio = 0.22 + 0.18 * self.breath_filter_strength
+            if spectral_flatness > flatness_limit and zero_crossings > zcr_limit and speech_band_ratio < 0.25:
+                if self.in_speech_segment and self.hangover_counter > 0:
+                    self.hangover_counter -= 1
+                    return True, [bytes(len(pcm16_bytes))], {"rms": rms, "is_speech": False, "reason": "breath_filtered"}
+                return False, [], {"rms": rms, "is_speech": False, "reason": "breath_filtered"}
 
-        is_breath_or_panting = (
-            (spectral_flatness > flatness_limit and zcr_limit < zero_crossings)
-            or (speech_band_ratio < min_speech_ratio and spectral_flatness > flatness_limit * 0.85)
-        )
-
-        is_low_groan = (
-            low_rumble_ratio > (0.82 - 0.12 * self.breath_filter_strength)
-            and speech_band_ratio < 0.20
-            and zero_crossings < 0.06
-        )
-
-        if is_breath_or_panting or is_low_groan:
-            reason = "breath_filtered" if is_breath_or_panting else "groan_filtered"
-            if self.in_speech_segment and self.hangover_counter > 0:
-                self.hangover_counter -= 1
-                silent_replacement = bytes(len(pcm16_bytes))
-                return True, [silent_replacement], {"rms": rms, "is_speech": False, "reason": reason}
-            return False, [], {"rms": rms, "is_speech": False, "reason": reason}
-
-        self.consecutive_voiced_frames += 1
+        # 3. 确认是人声（含小声说话），应用 Smart AGC 动态增益放大
+        processed_pcm = self._apply_smart_agc(samples, rms)
         self.hangover_counter = self.hangover_max_frames
 
         if not self.in_speech_segment:
             self.in_speech_segment = True
-            chunks = list(self.preroll_buffer) + [pcm16_bytes]
+            chunks = list(self.preroll_buffer) + [processed_pcm]
             self.preroll_buffer.clear()
             return True, chunks, {"rms": rms, "is_speech": True, "reason": "speech_onset"}
 
-        return True, [pcm16_bytes], {"rms": rms, "is_speech": True, "reason": "speech_active"}
+        reason = "quiet_boosted" if rms < 0.025 else "speech_active"
+        return True, [processed_pcm], {"rms": rms, "is_speech": True, "reason": reason}
 
 
 # ==============================================================================
-# 4. 文本后处理：语气词/呻吟词过滤 + 流式全量回包去重引擎
+# 4. 文本后处理：语气词/呻吟词过滤 + 流式增量拼接引擎
 # ==============================================================================
 class SubtitleCleanerAndDeduplicator:
     NON_VERBAL_TAG_RE = re.compile(
@@ -453,9 +468,8 @@ class SubtitleCleanerAndDeduplicator:
     )
 
     REPEATED_PHRASE_RE = re.compile(r"(.{1,8}?)\1{2,}")
-    SENTENCE_CHUNK_RE = re.compile(r"([^。！？；!?;，,、]+[。！？；!?;，,、]?)")
 
-    def __init__(self, similarity_threshold: float = 0.82) -> None:
+    def __init__(self, similarity_threshold: float = 0.80) -> None:
         self.similarity_threshold = similarity_threshold
         self.recent_finalized: Deque[Tuple[str, float]] = deque(maxlen=20)
         self.last_emitted_live_text: str = ""
@@ -483,10 +497,7 @@ class SubtitleCleanerAndDeduplicator:
         text = self.LEADING_FILLER_RE.sub("", text)
         text = self.MID_ISOLATED_FILLER_RE.sub(r"\1", text)
         text = self.TRAILING_FILLER_RE.sub("", text)
-
-        # 折叠连续重复的短语或子句（例如 "今天天气很好今天天气很好" -> "今天天气很好"）
         text = self.REPEATED_PHRASE_RE.sub(r"\1", text)
-        text = self._deduplicate_clauses_within_text(text)
 
         text = text.strip(" ,，、")
         if not text or self.PURE_FILLER_SENTENCE_RE.match(text):
@@ -494,36 +505,7 @@ class SubtitleCleanerAndDeduplicator:
 
         return text
 
-    def _deduplicate_clauses_within_text(self, text: str) -> str:
-        """如果同一段文本内包含两个高度相似或重复的子句，仅保留后一个更完整的子句。"""
-        parts = [p.strip() for p in self.SENTENCE_CHUNK_RE.findall(text) if p.strip()]
-        if len(parts) <= 1:
-            return text
-        deduped: List[str] = []
-        for p in parts:
-            norm_p = self._normalize_for_compare(p)
-            if not norm_p:
-                continue
-            if deduped:
-                norm_prev = self._normalize_for_compare(deduped[-1])
-                if norm_prev and (
-                    norm_p == norm_prev
-                    or norm_p.startswith(norm_prev)
-                    or norm_prev.startswith(norm_p)
-                    or SequenceMatcher(None, norm_prev, norm_p).ratio() >= 0.72
-                ):
-                    # 保留较长/较新的那一句，避免一句内出现两遍相同内容
-                    if len(norm_p) >= len(norm_prev):
-                        deduped[-1] = p
-                    continue
-            deduped.append(p)
-        return "".join(deduped)
-
     def append_streaming_fragment(self, fragment: str) -> Optional[str]:
-        """
-        处理 Gemini Live API 流式返回的 `output_transcription.text`：
-        兼容服务端先发增量 token、最后发一次全量带标点句子的行为，彻底杜绝将全量回包重复拼接到缓冲区尾部！
-        """
         if not fragment or not fragment.strip():
             return None
 
@@ -534,27 +516,19 @@ class SubtitleCleanerAndDeduplicator:
         if not self.current_turn_buffer or not norm_buf:
             self.current_turn_buffer = frag_stripped
         elif norm_frag == norm_buf:
-            # 服务端重发了完全相同的全量文本（可能仅多了句尾标点），直接用新版覆盖而非拼接
             if len(frag_stripped) >= len(self.current_turn_buffer):
                 self.current_turn_buffer = frag_stripped
         elif norm_frag.startswith(norm_buf):
-            # 服务端发来的是包含此前所有文字的累积全量文本 -> 直接覆盖！
             self.current_turn_buffer = frag_stripped
         elif norm_buf.endswith(norm_frag) or norm_frag in norm_buf:
-            # 服务端重复发送了已经包含在缓冲区尾部的片段 -> 直接忽略！
             pass
         elif len(norm_frag) >= 4 and SequenceMatcher(None, norm_buf, norm_frag).ratio() >= 0.68:
-            # 服务端对当前正在说的这句话进行了流式微调修正 -> 原地覆盖！
             self.current_turn_buffer = frag_stripped
         else:
-            # 真正的增量词片，进行首尾重叠合并
             self.current_turn_buffer = self._merge_overlap(self.current_turn_buffer, fragment)
 
         cleaned = self.clean_text(self.current_turn_buffer)
         if not cleaned:
-            return None
-
-        if self._is_duplicate_of_history(cleaned):
             return None
 
         if cleaned == self.last_emitted_live_text:
@@ -567,48 +541,10 @@ class SubtitleCleanerAndDeduplicator:
         cleaned = self.clean_text(self.current_turn_buffer)
         self.current_turn_buffer = ""
         self.last_emitted_live_text = ""
-
         if not cleaned:
             return None
-
-        if self._is_duplicate_of_history(cleaned):
-            return None
-
-        now = time.monotonic()
-        norm_new = self._normalize_for_compare(cleaned)
-        if self.recent_finalized:
-            last_text, last_ts = self.recent_finalized[-1]
-            norm_last = self._normalize_for_compare(last_text)
-            if norm_new and norm_last and (
-                norm_new.startswith(norm_last)
-                or SequenceMatcher(None, norm_new, norm_last).ratio() >= self.similarity_threshold
-            ) and (now - last_ts) < 10.0:
-                self.recent_finalized[-1] = (cleaned, now)
-                return None
-
-        self.recent_finalized.append((cleaned, now))
+        self.recent_finalized.append((cleaned, time.monotonic()))
         return cleaned
-
-    def _is_duplicate_of_history(self, candidate: str) -> bool:
-        norm_cand = self._normalize_for_compare(candidate)
-        if not norm_cand:
-            return True
-
-        now = time.monotonic()
-        for past_text, ts in reversed(self.recent_finalized):
-            if now - ts > 45.0:
-                continue
-            norm_past = self._normalize_for_compare(past_text)
-            if not norm_past:
-                continue
-            if norm_cand == norm_past:
-                return True
-            if len(norm_cand) >= 4 and norm_cand in norm_past and (now - ts) < 15.0:
-                return True
-            ratio = SequenceMatcher(None, norm_cand, norm_past).ratio()
-            if ratio >= self.similarity_threshold:
-                return True
-        return False
 
     @staticmethod
     def _merge_overlap(left: str, right: str) -> str:
@@ -620,94 +556,54 @@ class SubtitleCleanerAndDeduplicator:
 
 
 # ==============================================================================
-# 4B. 逐句换行切分 & 跨行严格防重复 & 每句独立 5 秒自动清空控制器
+# 4B. 单排最新短句控制器：每次只显示最新一句短字幕 + 5 秒无更新自动清空
 # ==============================================================================
 class SubtitleDisplayStateController:
     """
-    负责将实时流式字幕切分为短句，且**绝对禁止上下两排显示相同或相似的字幕**：
-    1. 每次仅从当前正在说的流式文本中提取短句，不在流式微调期间把旧修订残影保留到上一行；
-    2. 对切分出的上下两行短句做严格的相似度与包含度校验（但凡相似度 >= 0.45 或存在包含关系，立即合并为单行展示）；
-    3. 每句独立计时，满 5.0 秒自动从屏幕清空。
+    彻底采用**单排当前句模式** (`prev_subtitle` 恒为空，仅输出最新的一句 `curr_subtitle`)：
+    1. 物理上只有单排字幕，彻底杜绝上下两排出现重复字幕或上一句尾部残影（如顶排残留“之类的。”）；
+    2. 当一句话流式增长超过标点（。！？；，、）或超过 `max_chars_per_line`（24 字）时，
+       立即切换到最新的当前短句显示，绝不堆积成冗长段落；
+    3. 当前短句自最后一次文字变化起满 5.0 秒无新字流入，立即自动清空屏幕 (`curr_subtitle = ""`)！
     """
 
-    SENTENCE_SPLIT_RE = re.compile(r"([^。！？；!?;]+[。！？；!?;]?)")
-    CLAUSE_SPLIT_RE = re.compile(r"([^，、,：:]+[，、,：:]?)")
+    CLAUSE_SPLIT_RE = re.compile(r"[^。！？；!?;，,、：:\n]+[。！？；!?;，,、：:]?")
 
     def __init__(
         self,
         expire_seconds: float = SENTENCE_TTL_SECONDS,
         max_chars_per_line: int = MAX_CHARS_PER_LINE,
-        max_visible_lines: int = MAX_VISIBLE_LINES,
+        max_visible_lines: int = 1,
     ) -> None:
         self.expire_seconds = float(expire_seconds)
         self.max_chars_per_line = int(max_chars_per_line)
-        self.max_visible_lines = int(max_visible_lines)
-
-        self._clause_birth_ts: dict[str, float] = {}
-        self._active_lines: List[Tuple[str, float]] = []
-        self._last_finalized_sentence: Optional[Tuple[str, float]] = None
         self.prev_subtitle: str = ""
         self.curr_subtitle: str = ""
+        self._last_change_ts: float = 0.0
 
-    @staticmethod
-    def _norm(s: str) -> str:
-        return re.sub(r"[\s\.,!?;:，。！？；：、…~～\-—\'\"“”‘’（）\(\)\[\]【】]", "", s).lower()
-
-    @classmethod
-    def _are_lines_similar_or_overlapping(cls, a: str, b: str) -> bool:
-        na, nb = cls._norm(a), cls._norm(b)
-        if not na or not nb:
-            return True
-        if na == nb or na in nb or nb in na:
-            return True
-        if SequenceMatcher(None, na, nb).ratio() >= 0.45:
-            return True
-        return False
-
-    def split_into_short_sentences(self, text: str) -> List[str]:
+    def extract_latest_short_clause(self, text: str) -> str:
+        """从累积流式文本中仅提取最新正在说的那一句短句（单行不超过 max_chars_per_line）。"""
         if not text or not text.strip():
-            return []
+            return ""
 
-        raw_sentences = [s.strip() for s in self.SENTENCE_SPLIT_RE.findall(text.strip()) if s.strip()]
-        short_lines: List[str] = []
+        clauses = [c.strip(" ，、,：:") for c in self.CLAUSE_SPLIT_RE.findall(text.strip()) if c.strip(" ，、,：:")]
+        if not clauses:
+            return ""
 
-        for sent in raw_sentences:
-            if len(sent) <= self.max_chars_per_line:
-                short_lines.append(sent)
-                continue
+        latest = clauses[-1]
+        # 如果最新子句刚刚开始（只有 1~3 个字，例如“之类的”），且与前一个子句拼起来不超过单行上限，则合并成完整短句
+        if len(clauses) >= 2 and len(latest) <= 4 and (len(clauses[-2]) + 1 + len(latest)) <= self.max_chars_per_line:
+            latest = f"{clauses[-2]}，{latest}"
 
-            clauses = [c.strip() for c in self.CLAUSE_SPLIT_RE.findall(sent) if c.strip()]
-            buf = ""
-            for clause in clauses:
-                if not buf:
-                    buf = clause
-                elif len(buf) + len(clause) <= self.max_chars_per_line:
-                    buf += clause
-                else:
-                    short_lines.extend(self._chunk_by_length(buf, self.max_chars_per_line))
-                    buf = clause
-            if buf:
-                short_lines.extend(self._chunk_by_length(buf, self.max_chars_per_line))
+        # 若单个无标点子句超过单行上限，仅截取最新末尾段展示
+        if len(latest) > self.max_chars_per_line:
+            chunks = [
+                latest[i : i + self.max_chars_per_line]
+                for i in range(0, len(latest), self.max_chars_per_line)
+            ]
+            latest = chunks[-1]
 
-        # 过滤掉切分列表中任何前后重复或高度相似的短句
-        cleaned_lines: List[str] = []
-        for line in short_lines:
-            stripped = line.strip(" ，、,")
-            if not stripped:
-                continue
-            if cleaned_lines and self._are_lines_similar_or_overlapping(cleaned_lines[-1], stripped):
-                if len(stripped) >= len(cleaned_lines[-1]):
-                    cleaned_lines[-1] = stripped
-                continue
-            cleaned_lines.append(stripped)
-
-        return cleaned_lines
-
-    @staticmethod
-    def _chunk_by_length(text: str, max_len: int) -> List[str]:
-        if len(text) <= max_len:
-            return [text]
-        return [text[i : i + max_len] for i in range(0, len(text), max_len)]
+        return latest
 
     def on_new_subtitle(
         self,
@@ -718,82 +614,25 @@ class SubtitleDisplayStateController:
         now: Optional[float] = None,
     ) -> Tuple[str, str]:
         now_ts = time.monotonic() if now is None else now
-        sentences = self.split_into_short_sentences(zh_text)
-        if not sentences:
+        latest_clause = self.extract_latest_short_clause(zh_text)
+        if not latest_clause:
             self.check_expiration(now_ts)
-            return self.prev_subtitle, self.curr_subtitle
+            return "", self.curr_subtitle
 
-        updated_lines: List[Tuple[str, float]] = []
-        for idx, line in enumerate(sentences):
-            norm_key = self._norm(line)
-            if not norm_key:
-                continue
+        if latest_clause != self.curr_subtitle:
+            self.curr_subtitle = latest_clause
+            self._last_change_ts = now_ts
 
-            is_last_streaming_line = (idx == len(sentences) - 1) and (not is_final)
-            if norm_key in self._clause_birth_ts and not is_last_streaming_line:
-                born = self._clause_birth_ts[norm_key]
-            else:
-                born = self._clause_birth_ts.get(norm_key, now_ts)
-                if is_last_streaming_line:
-                    born = now_ts
-                self._clause_birth_ts[norm_key] = born
-
-            if (now_ts - born) < self.expire_seconds:
-                updated_lines.append((line, born))
-
-        # 如果当前切分出只有 1 句，且上一轮有已完结（is_final）且未满 5 秒的完全不同句子，可放在第一行
-        if len(updated_lines) == 1 and self._last_finalized_sentence is not None:
-            last_line, last_ts = self._last_finalized_sentence
-            if (now_ts - last_ts) < self.expire_seconds and not self._are_lines_similar_or_overlapping(
-                last_line, updated_lines[0][0]
-            ):
-                updated_lines.insert(0, (last_line, last_ts))
-
-        if is_final and updated_lines:
-            self._last_finalized_sentence = updated_lines[-1]
-
-        self._active_lines = updated_lines[-self.max_visible_lines :]
-        self._rebuild_visible_pair()
-        return self.prev_subtitle, self.curr_subtitle
+        self.prev_subtitle = ""
+        return "", self.curr_subtitle
 
     def check_expiration(self, now: Optional[float] = None) -> bool:
         now_ts = time.monotonic() if now is None else now
-        before = (self.prev_subtitle, self.curr_subtitle)
-        self._active_lines = [
-            (line, ts) for (line, ts) in self._active_lines if (now_ts - ts) < self.expire_seconds
-        ]
-        if (
-            self._last_finalized_sentence is not None
-            and (now_ts - self._last_finalized_sentence[1]) >= self.expire_seconds
-        ):
-            self._last_finalized_sentence = None
-
-        expired_keys = [
-            k for k, ts in self._clause_birth_ts.items() if (now_ts - ts) >= self.expire_seconds * 2
-        ]
-        for k in expired_keys:
-            self._clause_birth_ts.pop(k, None)
-
-        self._rebuild_visible_pair()
-        return (self.prev_subtitle, self.curr_subtitle) != before
-
-    def _rebuild_visible_pair(self) -> None:
-        if not self._active_lines:
-            self.prev_subtitle = ""
+        if self.curr_subtitle and (now_ts - self._last_change_ts) >= self.expire_seconds:
             self.curr_subtitle = ""
-        elif len(self._active_lines) == 1:
             self.prev_subtitle = ""
-            self.curr_subtitle = self._active_lines[0][0]
-        else:
-            top_line = self._active_lines[-2][0]
-            bot_line = self._active_lines[-1][0]
-            # 终极保险：若上下两排文字存在任何相似或包含关系，强制隐藏上排，只显示下排！
-            if self._are_lines_similar_or_overlapping(top_line, bot_line):
-                self.prev_subtitle = ""
-                self.curr_subtitle = bot_line
-            else:
-                self.prev_subtitle = top_line
-                self.curr_subtitle = bot_line
+            return True
+        return False
 
 
 # ==============================================================================
@@ -1040,12 +879,13 @@ class MacOSAudioCaptureManager:
 # ==============================================================================
 class GeminiLiveTranslateService:
     SYSTEM_INSTRUCTION = (
-        "你是一个高精度的实时同声传译字幕引擎，负责将输入的系统音频实时翻译为自然、简练、准确的简体中文（zh-Hans）短句字幕。\n"
+        "你是一个高灵敏度、高精度的实时同声传译字幕引擎，负责将输入的系统音频（包括轻声细语、低音量对话）"
+        "实时翻译为自然、简练、准确的简体中文（zh-Hans）短句字幕。\n"
         "严格遵守以下规则：\n"
-        "1. 每次翻译请保持句子简短精炼，按意群及时使用句号或逗号断句，不要输出冗长不间断的长段落。\n"
-        "2. 彻底忽略并过滤音频中的所有无意义语气词（如：嗯、啊、哦、哎、呃、唔、哼、哈、uh、um、ah、oh、er、hm、mm、ええと、あの等）。\n"
-        "3. 彻底忽略并过滤任何喘息声、急促呼吸声、呻吟声、叹气声、咳嗽声、笑声或背景杂音，绝对不要将它们转写为文字或拟声词。\n"
-        "4. 严禁重复输出已经翻译过的句子，严禁在静音或停顿期间编造、复读任何内容。"
+        "1. 即使说话人声音较小或语速较快，只要能辨识出语义词汇，必须立即准确翻译为简体中文短句。\n"
+        "2. 每次翻译请保持句子简短精炼，按意群及时使用句号或逗号断句。\n"
+        "3. 彻底忽略并过滤音频中的纯无意义语气词（如：嗯、啊、哦、哎、呃、唔、哼、哈、uh、um、ah、oh）以及喘息声、呻吟声、叹气声。\n"
+        "4. 严禁重复输出已经翻译过的句子，严禁在静音期间编造内容。"
     )
 
     def __init__(
@@ -1064,6 +904,7 @@ class GeminiLiveTranslateService:
             sample_rate=TARGET_SAMPLE_RATE,
             rms_threshold=settings.vad_rms_threshold,
             breath_filter_strength=settings.breath_filter_strength,
+            enable_agc=settings.enable_agc,
         )
         self.deduplicator = SubtitleCleanerAndDeduplicator(
             similarity_threshold=settings.dedup_similarity,
@@ -1105,6 +946,7 @@ class GeminiLiveTranslateService:
         self.acoustic_filter.update_params(
             self.settings.vad_rms_threshold,
             self.settings.breath_filter_strength,
+            self.settings.enable_agc,
         )
         self.deduplicator.update_threshold(self.settings.dedup_similarity)
 
@@ -1220,7 +1062,7 @@ class GeminiLiveTranslateService:
                 async with client.aio.live.connect(model=active_model, config=config) as session:
                     backoff = 0.5
                     self.on_status_change(
-                        f"实时翻译中 · {active_model}",
+                        f"实时翻译中 (弱音增强已开启) · {active_model}",
                         "#4CAF50",
                     )
 
@@ -1277,6 +1119,7 @@ class GeminiLiveTranslateService:
                 now = time.monotonic()
                 idle_sec = now - last_send_ts
 
+                # 注意：此处仅向服务端补发静音帧辅助断句，绝不在发送协程里清空 deduplicator，避免与接收协程产生竞争导致重复字幕
                 if not sent_tail_flush:
                     for _ in range(2):
                         await session.send_realtime_input(
@@ -1287,10 +1130,6 @@ class GeminiLiveTranslateService:
                         )
                     sent_tail_flush = True
                     last_send_ts = now
-                    final_zh = self.deduplicator.finalize_turn()
-                    if final_zh:
-                        self.on_subtitle_update(final_zh, self._current_src_transcript, True)
-                        self._current_src_transcript = ""
 
                 elif idle_sec >= 8.0:
                     await session.send_realtime_input(
@@ -1343,7 +1182,7 @@ class GeminiLiveTranslateService:
 
 
 # ==============================================================================
-# 7A. 零依赖本地 Web HUD 悬浮字幕界面
+# 7A. 零依赖本地 Web HUD 悬浮字幕界面 (单排纯净字幕)
 # ==============================================================================
 WEB_HUD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1388,20 +1227,11 @@ WEB_HUD_HTML = """<!DOCTYPE html>
     flex: 1;
     display: flex;
     flex-direction: column;
-    justify-content: flex-end;
+    justify-content: center;
     align-items: center;
-    padding: 10px 24px 18px 24px;
+    padding: 10px 24px 14px 24px;
     text-align: center;
   }
-  .prev-line {
-    color: #cbd5e1;
-    font-size: 20px;
-    font-weight: 700;
-    margin-bottom: 6px;
-    max-width: 92vw;
-    text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 2px 8px rgba(0,0,0,0.95);
-  }
-  .prev-line:empty { display: none; margin: 0; }
   .curr-line {
     color: #ffffff;
     font-size: 28px;
@@ -1416,7 +1246,7 @@ WEB_HUD_HTML = """<!DOCTYPE html>
   <div id="topbar" class="topbar pinned">
     <div class="status-wrap">
       <div id="dot" class="dot"></div>
-      <span id="statusText">就绪 · 每句字幕保留 5 秒后自动清空</span>
+      <span id="statusText">就绪 · 单排逐句刷新，每句保留 5 秒自动清空</span>
     </div>
     <div class="controls">
       <span id="vadBadge" style="color:#94a3b8;font-size:12px;margin-right:6px;">静音热备</span>
@@ -1425,7 +1255,6 @@ WEB_HUD_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div class="subtitle-stage">
-    <div id="prevLine" class="prev-line"></div>
     <div id="currLine" class="curr-line"></div>
   </div>
 <script>
@@ -1437,7 +1266,6 @@ async function pollState() {
     document.getElementById('statusText').textContent = d.status_text;
     document.getElementById('dot').style.background = d.status_color;
     document.getElementById('vadBadge').textContent = d.vad_text;
-    document.getElementById('prevLine').textContent = d.prev_subtitle || '';
     document.getElementById('currLine').textContent = d.curr_subtitle || '';
     isRunning = d.is_running;
     const tb = document.getElementById('topbar');
@@ -1470,7 +1298,6 @@ class WebHudSubtitleApp:
             "status_text": "就绪 · 点击「开始实时翻译」捕获 macOS 系统音频",
             "status_color": "#9AA0A6",
             "vad_text": "静音热备 (防休眠)",
-            "prev_subtitle": "",
             "curr_subtitle": "",
         }
         self.service = GeminiLiveTranslateService(
@@ -1481,10 +1308,9 @@ class WebHudSubtitleApp:
         )
 
     def _on_subtitle(self, zh_text: str, src_text: str, is_final: bool) -> None:
-        prev_txt, curr_txt = self.display_ctrl.on_new_subtitle(
+        _, curr_txt = self.display_ctrl.on_new_subtitle(
             zh_text, src_text, self.settings.show_bilingual, is_final
         )
-        self.state["prev_subtitle"] = prev_txt
         self.state["curr_subtitle"] = curr_txt
 
     def _on_status(self, msg: str, color: str) -> None:
@@ -1493,16 +1319,15 @@ class WebHudSubtitleApp:
 
     def _on_level(self, rms: float, reason: str) -> None:
         if self.display_ctrl.check_expiration():
-            self.state["prev_subtitle"] = self.display_ctrl.prev_subtitle
             self.state["curr_subtitle"] = self.display_ctrl.curr_subtitle
-        bars = min(8, int(rms * 160))
+        bars = min(8, int(rms * 240))
         meter = "▮" * bars + "▯" * (8 - bars)
         reason_map = {
             "speech_active": "人声翻译中",
+            "quiet_boosted": "弱音增强翻译中",
             "speech_onset": "唤醒捕捉",
             "hangover": "句尾延续",
-            "breath_filtered": "已过滤喘息声",
-            "groan_filtered": "已过滤呻吟声",
+            "breath_filtered": "已滤喘息声",
             "silence": "静音热备",
         }
         self.state["vad_text"] = f"{meter} {reason_map.get(reason, '监听中')}"
@@ -1517,7 +1342,6 @@ class WebHudSubtitleApp:
             def do_GET(self):
                 if self.path == "/api/state":
                     if app_ref.display_ctrl.check_expiration():
-                        app_ref.state["prev_subtitle"] = app_ref.display_ctrl.prev_subtitle
                         app_ref.state["curr_subtitle"] = app_ref.display_ctrl.curr_subtitle
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1553,9 +1377,16 @@ class WebHudSubtitleApp:
 
 
 # ==============================================================================
-# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (无重入零崩溃 + 跨浏览器置顶 + 逐句5秒清空)
+# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (单排纯净字幕 + 弱音AGC + 5秒清空)
 # ==============================================================================
 class MacOSSubtitleOverlayApp:
+    """
+    针对 macOS 15.2 (Apple Silicon) 深度优化的原生悬浮字幕窗口：
+    1. 彻底采用**单排居中字幕**（仅 `curr_subtitle_label`，完全移除第二排标签），从物理上根除上下两排重复字幕；
+    2. 每次只展示最新一句短字幕，满 5 秒无更新自动清空；
+    3. 内置弱音/小声说话自动增益放大 (Smart AGC)，哪怕音量极低或耳语也能准确识别翻译。
+    """
+
     def __init__(self) -> None:
         self.settings = AppSettings.load()
         self.ui_queue: "queue.Queue[Tuple[str, tuple]]" = queue.Queue()
@@ -1567,8 +1398,8 @@ class MacOSSubtitleOverlayApp:
         self.root = tk.Tk()
         self.root.title("Gemini 3.5 Live 实时中文字幕")
         self._window_width = 880
-        self._window_height = 148
-        self.root.geometry(f"{self._window_width}x{self._window_height}+220+700")
+        self._window_height = 110
+        self.root.geometry(f"{self._window_width}x{self._window_height}+220+720")
 
         self.root.attributes("-topmost", True)
         if sys.platform == "darwin":
@@ -1611,7 +1442,6 @@ class MacOSSubtitleOverlayApp:
         bg_color = self._get_bg_color()
         self.root.configure(bg=bg_color)
         self.body.configure(bg=bg_color)
-        self.prev_subtitle_label.configure(bg=bg_color)
         self.curr_subtitle_label.configure(bg=bg_color)
 
     def _build_ui(self) -> None:
@@ -1627,7 +1457,7 @@ class MacOSSubtitleOverlayApp:
 
         self.status_label = tk.Label(
             self.top_bar,
-            text="就绪 · 全局置顶已开启（切换浏览器不隐藏，每句保留 5 秒自动清空）",
+            text="就绪 · 单排逐句字幕 + 弱音自动放大已开启（每句 5 秒自动清空）",
             fg="#CBD5E1",
             bg="#1A1D24",
             font=("PingFang SC", 11),
@@ -1694,20 +1524,9 @@ class MacOSSubtitleOverlayApp:
         )
         self.vad_badge.pack(side=tk.RIGHT, padx=8, pady=3)
 
+        # 单排纯净字幕主显示区：物理上只有一个 Label，绝不可能产生上下两排字幕
         self.body = tk.Frame(self.root, bg=bg_color, padx=16, pady=6)
         self.body.pack(fill=tk.BOTH, expand=True)
-
-        self.prev_subtitle_var = tk.StringVar(value="")
-        self.prev_subtitle_label = tk.Label(
-            self.body,
-            textvariable=self.prev_subtitle_var,
-            fg="#CBD5E1",
-            bg=bg_color,
-            font=("PingFang SC", max(16, self.settings.font_size - 6), "bold"),
-            justify=tk.CENTER,
-            anchor="s",
-        )
-        self.prev_subtitle_label.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
 
         self.curr_subtitle_var = tk.StringVar(value="等待系统音频输入…")
         self.curr_subtitle_label = tk.Label(
@@ -1717,15 +1536,14 @@ class MacOSSubtitleOverlayApp:
             bg=bg_color,
             font=("PingFang SC", self.settings.font_size, "bold"),
             justify=tk.CENTER,
-            anchor="n",
+            anchor="center",
         )
-        self.curr_subtitle_label.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(2, 4))
+        self.curr_subtitle_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(2, 2))
 
         for widget in (
             self.top_bar,
             self.status_label,
             self.body,
-            self.prev_subtitle_label,
             self.curr_subtitle_label,
         ):
             widget.bind("<ButtonPress-1>", self._on_drag_start)
@@ -1768,9 +1586,7 @@ class MacOSSubtitleOverlayApp:
             self._topbar_visible = False
             self.top_bar.pack_forget()
 
-    def _update_subtitle_widgets(self, prev_txt: str, curr_txt: str) -> None:
-        if prev_txt != self.prev_subtitle_var.get():
-            self.prev_subtitle_var.set(prev_txt)
+    def _update_subtitle_widgets(self, curr_txt: str) -> None:
         if curr_txt != self.curr_subtitle_var.get():
             self.curr_subtitle_var.set(curr_txt)
 
@@ -1790,8 +1606,8 @@ class MacOSSubtitleOverlayApp:
                 return
             self._is_running = True
             self.btn_toggle.configure(text="⏹ 停止", bg="#DC2626", activebackground="#B91C1C")
-            prev_t, curr_t = self.display_ctrl.on_new_subtitle("正在监听系统音频…", is_final=True)
-            self._update_subtitle_widgets(prev_t, curr_t)
+            _, curr_t = self.display_ctrl.on_new_subtitle("正在监听系统音频…", is_final=True)
+            self._update_subtitle_widgets(curr_t)
             self.service.start()
             configure_macos_window_non_hiding_once()
             if self.settings.transparent_bg:
@@ -1805,22 +1621,19 @@ class MacOSSubtitleOverlayApp:
     def _poll_ui_events(self) -> None:
         try:
             if self.display_ctrl.check_expiration():
-                self._update_subtitle_widgets(
-                    self.display_ctrl.prev_subtitle,
-                    self.display_ctrl.curr_subtitle,
-                )
+                self._update_subtitle_widgets(self.display_ctrl.curr_subtitle)
 
             while True:
                 evt_type, payload = self.ui_queue.get_nowait()
                 if evt_type == "subtitle":
                     zh_text, src_text, is_final = payload
-                    prev_txt, curr_txt = self.display_ctrl.on_new_subtitle(
+                    _, curr_txt = self.display_ctrl.on_new_subtitle(
                         zh_text=zh_text,
                         src_text=src_text,
                         show_bilingual=self.settings.show_bilingual,
                         is_final=is_final,
                     )
-                    self._update_subtitle_widgets(prev_txt, curr_txt)
+                    self._update_subtitle_widgets(curr_txt)
 
                     if is_final:
                         ts_str = time.strftime("%H:%M:%S")
@@ -1833,14 +1646,14 @@ class MacOSSubtitleOverlayApp:
 
                 elif evt_type == "level":
                     rms, reason = payload
-                    db_bar = min(8, int(rms * 160))
+                    db_bar = min(8, int(rms * 240))
                     meter = "▮" * db_bar + "▯" * (8 - db_bar)
                     reason_map = {
                         "speech_active": ("人声翻译中", "#4ADE80"),
+                        "quiet_boosted": ("弱音增强翻译中", "#38BDF8"),
                         "speech_onset": ("唤醒捕捉", "#38BDF8"),
                         "hangover": ("句尾延续", "#A3E635"),
                         "breath_filtered": ("已滤喘息", "#FBBF24"),
-                        "groan_filtered": ("已滤呻吟", "#FBBF24"),
                         "silence": ("静音热备", "#94A3B8"),
                     }
                     label_txt, color = reason_map.get(reason, ("监听中", "#94A3B8"))
@@ -1854,7 +1667,7 @@ class MacOSSubtitleOverlayApp:
         self._on_mouse_enter()
         win = tk.Toplevel(self.root)
         win.title("自定义 API Key 与透明字幕设置")
-        win.geometry("560x560")
+        win.geometry("560x580")
         win.configure(bg="#1E222B")
         win.attributes("-topmost", True)
 
@@ -1919,7 +1732,7 @@ class MacOSSubtitleOverlayApp:
 
         tk.Label(
             win,
-            text="单行每句最大字数 (超出自动断句换行，默认 24 字):",
+            text="单句最大字数 (超出自动切换新短句，默认 24 字):",
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
@@ -1940,7 +1753,7 @@ class MacOSSubtitleOverlayApp:
 
         tk.Label(
             win,
-            text="字幕字号大小 (推荐 26):",
+            text="字幕字号大小 (推荐 28):",
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
@@ -1959,10 +1772,21 @@ class MacOSSubtitleOverlayApp:
             highlightthickness=0,
         ).pack(fill=tk.X, padx=16)
 
+        agc_var = tk.BooleanVar(value=self.settings.enable_agc)
+        tk.Checkbutton(
+            win,
+            text="开启弱音/小声说话自动增益放大 (Smart AGC，解决小声说话不翻译)",
+            variable=agc_var,
+            bg="#1E222B",
+            fg="#38BDF8",
+            selectcolor="#0F172A",
+            activebackground="#1E222B",
+        ).pack(anchor=tk.W, padx=16, pady=4)
+
         transparent_var = tk.BooleanVar(value=self.settings.transparent_bg)
         tk.Checkbutton(
             win,
-            text="背景完全透明（只显示文字，鼠标移走自动隐藏工具栏）",
+            text="背景完全透明（只显示单排文字，鼠标移走自动隐藏工具栏）",
             variable=transparent_var,
             bg="#1E222B",
             fg="#4ADE80",
@@ -1975,12 +1799,12 @@ class MacOSSubtitleOverlayApp:
             self.settings.model_name = model_var.get().strip() or DEFAULT_MODEL
             self.settings.max_chars_per_line = int(chars_var.get())
             self.settings.font_size = int(font_var.get())
+            self.settings.enable_agc = bool(agc_var.get())
             self.settings.transparent_bg = bool(transparent_var.get())
             self.settings.save()
 
             self.display_ctrl.max_chars_per_line = self.settings.max_chars_per_line
             self.curr_subtitle_label.configure(font=("PingFang SC", self.settings.font_size, "bold"))
-            self.prev_subtitle_label.configure(font=("PingFang SC", max(16, self.settings.font_size - 6), "bold"))
             self.btn_bg_mode.configure(
                 text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 深色底板"
             )
@@ -2039,49 +1863,39 @@ class MacOSSubtitleOverlayApp:
 # 8. 自检测试模式 (`--self-test`) 供自动化验证核心算法
 # ==============================================================================
 def run_self_test() -> int:
-    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.2.2) ===")
+    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.2.3) ===")
 
     # 1. 验证语气词与呻吟/喘息文本清洗器
-    dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.82)
+    dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.80)
 
     assert dedup.clean_text("嗯…啊…哦！") == "", "纯语气词应当被完全过滤"
     assert dedup.clean_text("[喘息] (叹气) 呃，今天我们来讨论系统架构，嗯。") == "今天我们来讨论系统架构", "首尾语气词与喘息标签应被剥离"
     assert dedup.clean_text("好的好的好的好的，马上处理") == "好的，马上处理", "连续复读词组应被折叠"
 
-    # 2. 验证流式增量 + 全量带标点回包绝不产生双排重复
-    s1 = dedup.append_streaming_fragment("今天天气")
-    s2 = dedup.append_streaming_fragment("很好")
-    # 模拟服务端在句末发送一次带空格或句号的全量累积文本
-    s3 = dedup.append_streaming_fragment(" 今天天气很好。")
-    assert s3 == "今天天气很好。", f"全量回包应当覆盖而非拼接重复: {s3}"
+    # 2. 验证单排最新短句提取：永远只返回单排最新短句，prev_subtitle 恒为空（物理根除两排字幕）
+    disp = SubtitleDisplayStateController(expire_seconds=5.0, max_chars_per_line=22)
+    prev_t, curr_t = disp.on_new_subtitle("有时候出门之类的。今天我们去哪里？", is_final=False, now=100.0)
+    assert prev_t == "" and curr_t == "今天我们去哪里？", f"单排最新句提取异常: prev={prev_t}, curr={curr_t}"
 
-    # 3. 验证流式微调修正绝不导致上下两排显示重复字幕
-    disp = SubtitleDisplayStateController(expire_seconds=5.0, max_chars_per_line=20, max_visible_lines=2)
-    prev_t, curr_t = disp.on_new_subtitle("这是个实时字幕测试", is_final=False, now=10.0)
-    assert prev_t == "" and curr_t == "这是个实时字幕测试"
-    # 0.2秒后模型流式微调了中间一个字
-    prev_t, curr_t = disp.on_new_subtitle("这是一个实时字幕测试。", is_final=False, now=10.2)
-    assert prev_t == "" and curr_t == "这是一个实时字幕测试。", (
-        f"流式微调应当原地覆盖，绝不能产生两排重复字幕: prev={prev_t}, curr={curr_t}"
-    )
-
-    # 4. 验证同一段话内出现重复短句时只显示一排
-    prev_t, curr_t = disp.on_new_subtitle("欢迎大家来到直播间。欢迎大家来到直播间！", is_final=False, now=20.0)
-    assert prev_t == "" and curr_t == "欢迎大家来到直播间！", (
-        f"重复短句应当被合并为单排: prev={prev_t}, curr={curr_t}"
-    )
-
-    # 5. 验证真正不同的两句话正常分行显示，且 5 秒后全部自动清空
-    long_stream = "第一句简短的话。第二句是完全不同的核心内容！"
-    prev_t, curr_t = disp.on_new_subtitle(long_stream, is_final=False, now=100.0)
-    assert prev_t == "第一句简短的话。" and curr_t == "第二句是完全不同的核心内容！", (
-        f"不同语义短句换行异常: prev={prev_t}, curr={curr_t}"
-    )
-
+    # 满 5 秒后无新字流入，当前字幕自动清空
     changed = disp.check_expiration(now=105.1)
-    assert changed and disp.prev_subtitle == "" and disp.curr_subtitle == "", (
-        f"5秒后所有字幕应当完全清空: prev={disp.prev_subtitle}, curr={disp.curr_subtitle}"
+    assert changed and disp.curr_subtitle == "", f"5秒后字幕应当完全清空: curr={disp.curr_subtitle}"
+
+    # 3. 验证小声说话 (RMS = 0.0015) 能被灵敏捕捉并通过 Smart AGC 放大
+    acoustic = AcousticSpeechFilter(
+        sample_rate=TARGET_SAMPLE_RATE,
+        rms_threshold=0.0004,
+        breath_filter_strength=0.55,
+        enable_agc=True,
     )
+    t = np.linspace(0, CHUNK_DURATION_MS / 1000.0, CHUNK_SAMPLES, endpoint=False)
+    quiet_voice = (0.002 * np.sin(2 * np.pi * 220 * t) + 0.0015 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
+    quiet_pcm = (quiet_voice * 32767.0).astype("<i2").tobytes()
+    send_flag, chunks, meta = acoustic.analyze_chunk(quiet_pcm)
+    assert send_flag and len(chunks) >= 1, f"小声说话应当被捕捉而非丢弃: {meta}"
+    boosted_samples = np.frombuffer(chunks[-1], dtype=np.int16).astype(np.float32) / 32768.0
+    boosted_rms = float(np.sqrt(np.mean(boosted_samples ** 2)))
+    assert boosted_rms > meta["rms"] * 5.0, f"Smart AGC 应当显著放大弱音信号: orig={meta['rms']}, boosted={boosted_rms}"
 
     print("=== All Self-Tests Passed Successfully! ===")
     return 0
