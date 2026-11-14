@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.2.0)
+macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.2.1)
 ===========================================================================
 基于 Google Gemini Live API (`gemini-3.5-live-translate-preview`) 构建的桌面级实时字幕工具。
 
@@ -11,12 +11,13 @@ macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软�
      直接抓取 macOS 系统桌面音频并输出 16kHz 16-bit 单声道 PCM 流。
    - 模式 B（CoreAudio 虚拟声卡/输入设备）：支持 BlackHole 2ch、Loopback 或任意麦克风/聚合设备。
 2. 逐句换行显示 + 每句严格 5 秒自动清空 (`SentenceSegmentedSubtitleController`)：
-   - 自动将长串流式翻译按标点（。！？；，、）及语义长度（每行不超过 24 字）切分为独立短句并逐句换行显示。
-   - 屏幕上最多同时展示最近 2 句短字幕，每句字幕独立计时，满 5.0 秒后自动清空消失；若满 5 秒无新语音，屏幕字幕完全清空。
-3. 强力跨应用全局置顶 (`macOS Cocoa NSWindow Level + hidesOnDeactivate=False`)：
-   - 通过 macOS 原生 Objective-C Runtime (`libobjc.A.dylib` / `AppKit`) 将字幕窗口提升至
-     `NSPopUpMenuWindowLevel (101)`，强制设置 `setHidesOnDeactivate(False)` 与
-     `CanJoinAllSpaces | FullScreenAuxiliary`，彻底解决切换到浏览器或其他全屏应用时字幕被隐藏的问题。
+   - 自动将流式长文按标点（。！？；，、）及语义长度（每句不超过 24 字）切分为独立短句并逐句换行显示。
+   - 屏幕上最多同时展示 2 句短字幕，每句独立计时，满 5.0 秒自动清空；停止说话 5 秒后屏幕完全清空。
+3. 安全无崩溃的跨应用全局置顶 (`PYFUNCTYPE` 单次设置 `hidesOnDeactivate=False` + `NSStatusWindowLevel`)：
+   - 修复了 macOS 15.2 Python 3.12 下 `CFUNCTYPE` 释放 GIL 调 `orderFrontRegardless` 触发
+     `TKApplication windowMapped:` 重入导致的 `PyEval_RestoreThread` SIGABRT 崩溃。
+   - 采用 `ctypes.PYFUNCTYPE`（保持 GIL 不释放）单次设置 `setHidesOnDeactivate:(False)` 与
+     `setLevel:(25)`，不调用任何重入式窗口排序 API，彻底解决切换浏览器时窗口隐藏与闪退问题。
 4. 纯透明无边框文字悬浮 + 语气词/喘息/呻吟三重过滤 + 永不休眠长间隙秒级唤醒。
 """
 
@@ -116,21 +117,20 @@ MAX_VISIBLE_LINES = 2
 
 
 # ==============================================================================
-# 0. macOS 原生 Cocoa 窗口全局置顶与防隐藏增强器 (解决打开浏览器被遮挡/隐藏问题)
+# 0. macOS 原生 Cocoa 窗口防隐藏与全局置顶设置 (GIL-Safe PYFUNCTYPE, 无重入通知)
 # ==============================================================================
-def enforce_macos_always_on_top_and_no_hide() -> bool:
+def configure_macos_window_non_hiding_once() -> bool:
     """
-    通过 macOS 原生 Objective-C Runtime (`libobjc.A.dylib`) 配置当前进程的所有 NSWindow：
-    1. `setHidesOnDeactivate_(False)`：禁止在切换到浏览器/其他 App 时自动隐藏窗口；
-    2. `setLevel_(101)` (`NSPopUpMenuWindowLevel` / `kCGStatusWindowLevel`)：强制悬浮在所有普通窗口和浏览器之上；
-    3. `setCollectionBehavior_(273)` (`CanJoinAllSpaces | Stationary | FullScreenAuxiliary`)：支持全屏空间置顶。
+    在窗口完成首次映射后单次调用：
+    - 使用 `ctypes.PYFUNCTYPE`（保持 Python GIL 不被释放，杜绝与 `_tkinter` 的 `PyEval_RestoreThread` 冲突）；
+    - 仅设置 `setHidesOnDeactivate:(False)`、`setLevel:(25)` 与 `setCollectionBehavior:(273)` 属性标志位；
+    - 绝不调用 `orderFrontRegardless` 或任何触发 `windowMapped:` 同步通知的 API，彻底杜绝 Tcl/Tk 重入崩溃。
     """
     if sys.platform != "darwin":
         return False
     try:
         objc_path = ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib"
         objc = ctypes.cdll.LoadLibrary(objc_path)
-        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
 
         objc.objc_getClass.restype = ctypes.c_void_p
         objc.objc_getClass.argtypes = [ctypes.c_char_p]
@@ -140,24 +140,20 @@ def enforce_macos_always_on_top_and_no_hide() -> bool:
         def _sel(name: bytes) -> ctypes.c_void_p:
             return objc.sel_registerName(name)
 
-        # 无参数返回指针的 objc_msgSend
-        msg_ptr = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+        # 关键：使用 PYFUNCTYPE 保持 GIL，防止触发 PyEval_RestoreThread Fatal Error
+        msg_ptr = ctypes.PYFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
             ("objc_msgSend", objc)
         )
-        # 单整型参数 (NSInteger / NSUInteger) 的 objc_msgSend
-        msg_int = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
+        msg_int = ctypes.PYFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(
             ("objc_msgSend", objc)
         )
-        # 单布尔参数 (BOOL) 的 objc_msgSend
-        msg_bool = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(
+        msg_bool = ctypes.PYFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(
             ("objc_msgSend", objc)
         )
-        # 返回 NSUInteger 的 objc_msgSend
-        msg_ret_uint = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(
+        msg_ret_uint = ctypes.PYFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(
             ("objc_msgSend", objc)
         )
-        # 按索引取元素的 objectAtIndex:
-        msg_at_idx = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(
+        msg_at_idx = ctypes.PYFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(
             ("objc_msgSend", objc)
         )
 
@@ -174,12 +170,11 @@ def enforce_macos_always_on_top_and_no_hide() -> bool:
         sel_hides = _sel(b"setHidesOnDeactivate:")
         sel_level = _sel(b"setLevel:")
         sel_behavior = _sel(b"setCollectionBehavior:")
-        sel_order_front = _sel(b"orderFrontRegardless")
 
         # CanJoinAllSpaces (1 << 0) | Stationary (1 << 4) | FullScreenAuxiliary (1 << 8) = 273
         behavior_flags = (1 << 0) | (1 << 4) | (1 << 8)
-        # NSPopUpMenuWindowLevel = 101 (高于普通窗口 0、浮动窗口 3、状态栏 25)
-        floating_level = 101
+        # NSStatusWindowLevel = 25 (高于普通应用和全屏浏览器)
+        floating_level = 25
 
         for i in range(count):
             win = msg_at_idx(windows_array, _sel(b"objectAtIndex:"), i)
@@ -187,10 +182,9 @@ def enforce_macos_always_on_top_and_no_hide() -> bool:
                 msg_bool(win, sel_hides, False)
                 msg_int(win, sel_level, floating_level)
                 msg_int(win, sel_behavior, behavior_flags)
-                msg_ptr(win, sel_order_front)
         return True
     except Exception as exc:
-        logger.debug("Cocoa 窗口置顶增强跳过: %s", exc)
+        logger.debug("Cocoa 窗口属性配置跳过: %s", exc)
         return False
 
 
@@ -583,14 +577,6 @@ class SubtitleCleanerAndDeduplicator:
 # 4B. 逐句换行切分 & 每句独立 5 秒自动清空控制器
 # ==============================================================================
 class SubtitleDisplayStateController:
-    """
-    负责将实时流式长字幕切分为短句，按句换行展示，且**每一句只保留 5 秒**：
-    1. 遇到句末标点（。！？；!?;）立即断句换行；
-    2. 若单句超过 `max_chars_per_line`（默认 24 字），优先在逗号/顿号（，、,）处断句换行，否则按字数软切分；
-    3. 每个已切分完成的短句拥有自己独立的创建时间戳 `born_ts`，满 5.0 秒立即从屏幕上移除；
-    4. 正在说的最新一句同样在最后一次更新满 5.0 秒后自动清空，保证停止说话 5 秒后屏幕 100% 清空！
-    """
-
     SENTENCE_SPLIT_RE = re.compile(r"([^。！？；!?;]+[。！？；!?;]?)")
     CLAUSE_SPLIT_RE = re.compile(r"([^，、,：:]+[，、,：:]?)")
 
@@ -604,14 +590,12 @@ class SubtitleDisplayStateController:
         self.max_chars_per_line = int(max_chars_per_line)
         self.max_visible_lines = int(max_visible_lines)
 
-        # 保存每个短句首次出现的时间戳: {normalized_clause: first_seen_timestamp}
         self._clause_birth_ts: dict[str, float] = {}
         self._active_lines: List[Tuple[str, float]] = []
         self.prev_subtitle: str = ""
         self.curr_subtitle: str = ""
 
     def split_into_short_sentences(self, text: str) -> List[str]:
-        """将长文本按标点和长度切分为易读的短句列表（每句一行）。"""
         if not text or not text.strip():
             return []
 
@@ -623,7 +607,6 @@ class SubtitleDisplayStateController:
                 short_lines.append(sent)
                 continue
 
-            # 句子过长时，先按逗号/顿号切分子句
             clauses = [c.strip() for c in self.CLAUSE_SPLIT_RE.findall(sent) if c.strip()]
             buf = ""
             for clause in clauses:
@@ -665,7 +648,6 @@ class SubtitleDisplayStateController:
             if not norm_key:
                 continue
 
-            # 已完成的前序短句沿用其首次上屏时间戳（满 5 秒即消隐，绝不残留成大段长文）
             is_last_streaming_line = (idx == len(sentences) - 1) and (not is_final)
             if norm_key in self._clause_birth_ts and not is_last_streaming_line:
                 born = self._clause_birth_ts[norm_key]
@@ -678,30 +660,30 @@ class SubtitleDisplayStateController:
             if (now_ts - born) < self.expire_seconds:
                 updated_lines.append((line, born))
 
-        # 合并上一轮尚未过期的短句（当新一轮 turn 开始时，保留上一轮未满 5 秒的最后一句作为上方行）
         for old_line, old_ts in self._active_lines:
             if (now_ts - old_ts) < self.expire_seconds:
                 old_key = re.sub(r"[\s，。！？；、,.!?;]", "", old_line)
-                if all(old_key not in re.sub(r"[\s，。！？；、,.!?;]", "", u[0]) and re.sub(r"[\s，。！？；、,.!?;]", "", u[0]) not in old_key for u in updated_lines):
+                if all(
+                    old_key not in re.sub(r"[\s，。！？；、,.!?;]", "", u[0])
+                    and re.sub(r"[\s，。！？；、,.!?;]", "", u[0]) not in old_key
+                    for u in updated_lines
+                ):
                     updated_lines.insert(0, (old_line, old_ts))
 
-        # 只保留最近 max_visible_lines 句（默认最多 2 行：上一句 + 当前句，逐句换行）
         self._active_lines = updated_lines[-self.max_visible_lines :]
         self._rebuild_visible_pair()
         return self.prev_subtitle, self.curr_subtitle
 
     def check_expiration(self, now: Optional[float] = None) -> bool:
-        """
-        每 50ms 检查一次所有在屏短句：任何满 5.0 秒的句子立即清空移除！
-        """
         now_ts = time.monotonic() if now is None else now
         before = list(self._active_lines)
         self._active_lines = [
             (line, ts) for (line, ts) in self._active_lines if (now_ts - ts) < self.expire_seconds
         ]
 
-        # 定期清理过期的字典缓存
-        expired_keys = [k for k, ts in self._clause_birth_ts.items() if (now_ts - ts) >= self.expire_seconds * 2]
+        expired_keys = [
+            k for k, ts in self._clause_birth_ts.items() if (now_ts - ts) >= self.expire_seconds * 2
+        ]
         for k in expired_keys:
             self._clause_birth_ts.pop(k, None)
 
@@ -1479,15 +1461,16 @@ class WebHudSubtitleApp:
 
 
 # ==============================================================================
-# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (跨浏览器强制置顶 + 逐句换行 + 5秒清空)
+# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (无重入零崩溃 + 跨浏览器置顶 + 逐句5秒清空)
 # ==============================================================================
 class MacOSSubtitleOverlayApp:
     """
-    针对 macOS 15 深度优化的原生悬浮字幕窗口：
-    1. 强力全局置顶 (`enforce_macos_always_on_top_and_no_hide`)：设置 Cocoa `hidesOnDeactivate=False`
-       及 `NSPopUpMenuWindowLevel (101)`，打开或点击浏览器、全屏视频时永不隐藏、永不掉到后台；
-    2. 逐句换行短句切分：单句不超过 24 字，最多同屏显示 2 行短句；
-    3. 每句严格保留 5 秒：每句满 5.0 秒后自动清空消失，停止说话 5 秒后屏幕完全清空。
+    针对 macOS 15.2 (Apple Silicon) 深度优化的原生悬浮字幕窗口：
+    1. 采用 `overrideredirect(True)` + `wm_attributes("-transparent", True)` 一次性初始化窗口，
+       运行期切换透明/底板仅切换 Frame 背景色，绝不销毁重建底层 NSWindow；
+    2. 窗口完成首次映射后，单次通过 `PYFUNCTYPE` 设置 `setHidesOnDeactivate(False)` 与
+       `NSStatusWindowLevel (25)`，避免 `CFUNCTYPE` 释放 GIL 或调用 `orderFrontRegardless` 引发重入崩溃；
+    3. 零 `update_idletasks()` 调用，固定双行短句空间（每句 <=24 字、最多 2 行、满 5 秒自动清空）。
     """
 
     def __init__(self) -> None:
@@ -1500,24 +1483,28 @@ class MacOSSubtitleOverlayApp:
 
         self.root = tk.Tk()
         self.root.title("Gemini 3.5 Live 实时中文字幕")
-        self._window_width = 860
-        self.root.geometry(f"{self._window_width}x130+240+720")
-        self.root.minsize(480, 68)
+        self._window_width = 880
+        self._window_height = 148
+        self.root.geometry(f"{self._window_width}x{self._window_height}+220+700")
+
+        # 一次性启用无边框与 macOS 原生透明通道支持（后续仅改背景色，不重建 NSWindow）
+        self.root.attributes("-topmost", True)
+        if sys.platform == "darwin":
+            try:
+                self.root.overrideredirect(True)
+                self.root.wm_attributes("-transparent", True)
+            except tk.TclError:
+                pass
 
         self._drag_offset_x = 0
         self._drag_offset_y = 0
         self._is_running = False
         self._topbar_visible = True
         self._hover_hide_job: Optional[str] = None
-        self._topmost_tick = 0
         self._history_lines: Deque[str] = deque(maxlen=200)
 
         self._build_ui()
-        self._apply_transparency_and_topmost()
-
-        # 监听窗口失焦事件（当用户点击浏览器时立即重新拉起置顶）
-        self.root.bind("<FocusOut>", lambda _e: self._assert_topmost())
-        self.root.bind("<Map>", lambda _e: self._assert_topmost())
+        self._apply_bg_colors()
 
         self.service = GeminiLiveTranslateService(
             settings=self.settings,
@@ -1526,57 +1513,30 @@ class MacOSSubtitleOverlayApp:
             on_audio_level=lambda rms, reason: self.ui_queue.put(("level", (rms, reason))),
         )
 
+        # 在窗口映射稳定后（350ms），单次执行 GIL-safe 的 Cocoa 防隐藏与置顶级别配置
+        self.root.after(350, configure_macos_window_non_hiding_once)
         self.root.after(50, self._poll_ui_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if not self.settings.api_key:
-            self.root.after(300, self._open_settings_dialog)
+            self.root.after(500, self._open_settings_dialog)
 
     def _get_bg_color(self) -> str:
         if self.settings.transparent_bg and sys.platform == "darwin":
             return "systemTransparent"
-        return "#121417"
+        return "#141820"
 
-    def _assert_topmost(self) -> None:
-        """强制维持窗口在 macOS 浏览器与全屏应用之上，禁止失焦隐藏。"""
-        try:
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-        except Exception:
-            pass
-        enforce_macos_always_on_top_and_no_hide()
-
-    def _apply_transparency_and_topmost(self) -> None:
+    def _apply_bg_colors(self) -> None:
         bg_color = self._get_bg_color()
-        if sys.platform == "darwin":
-            try:
-                if self.settings.transparent_bg:
-                    self.root.overrideredirect(True)
-                    self.root.wm_attributes("-transparent", True)
-                    self.root.attributes("-alpha", 1.0)
-                else:
-                    self.root.overrideredirect(False)
-                    self.root.wm_attributes("-transparent", False)
-                    self.root.attributes("-alpha", self.settings.window_alpha)
-            except tk.TclError:
-                pass
-        else:
-            try:
-                self.root.attributes("-alpha", self.settings.window_alpha)
-            except tk.TclError:
-                pass
-
         self.root.configure(bg=bg_color)
         self.body.configure(bg=bg_color)
         self.prev_subtitle_label.configure(bg=bg_color)
         self.curr_subtitle_label.configure(bg=bg_color)
-        self._sync_window_height()
-        self.root.after(80, self._assert_topmost)
 
     def _build_ui(self) -> None:
         bg_color = self._get_bg_color()
 
-        self.top_bar = tk.Frame(self.root, bg="#1A1D24", height=34)
+        self.top_bar = tk.Frame(self.root, bg="#1A1D24", height=32)
         self.top_bar.pack(fill=tk.X, side=tk.TOP)
 
         self.status_dot = tk.Label(
@@ -1586,7 +1546,7 @@ class MacOSSubtitleOverlayApp:
 
         self.status_label = tk.Label(
             self.top_bar,
-            text="就绪 · 全局置顶已开启（切换浏览器不隐藏，每句5秒自动清空）",
+            text="就绪 · 全局置顶已开启（切换浏览器不隐藏，每句保留 5 秒自动清空）",
             fg="#CBD5E1",
             bg="#1A1D24",
             font=("PingFang SC", 11),
@@ -1617,7 +1577,7 @@ class MacOSSubtitleOverlayApp:
 
         self.btn_bg_mode = tk.Button(
             self.top_bar,
-            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板",
+            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 深色底板",
             command=self._toggle_bg_mode,
             **btn_style,
         )
@@ -1653,7 +1613,7 @@ class MacOSSubtitleOverlayApp:
         )
         self.vad_badge.pack(side=tk.RIGHT, padx=8, pady=3)
 
-        # 字幕主显示区（逐句换行：第一行显示上一短句，第二行显示当前短句，每句保留 5 秒自动清空）
+        # 双行逐句显示区：固定上下两行短句槽位，无需频繁 pack/unpack 或 update_idletasks
         self.body = tk.Frame(self.root, bg=bg_color, padx=16, pady=6)
         self.body.pack(fill=tk.BOTH, expand=True)
 
@@ -1664,9 +1624,10 @@ class MacOSSubtitleOverlayApp:
             fg="#CBD5E1",
             bg=bg_color,
             font=("PingFang SC", max(16, self.settings.font_size - 6), "bold"),
-            wraplength=self._window_width - 40,
             justify=tk.CENTER,
+            anchor="s",
         )
+        self.prev_subtitle_label.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
 
         self.curr_subtitle_var = tk.StringVar(value="等待系统音频输入…")
         self.curr_subtitle_label = tk.Label(
@@ -1675,10 +1636,10 @@ class MacOSSubtitleOverlayApp:
             fg="#FFFFFF",
             bg=bg_color,
             font=("PingFang SC", self.settings.font_size, "bold"),
-            wraplength=self._window_width - 40,
             justify=tk.CENTER,
+            anchor="n",
         )
-        self.curr_subtitle_label.pack(side=tk.BOTTOM, fill=tk.X, expand=True, pady=(2, 4))
+        self.curr_subtitle_label.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(2, 4))
 
         for widget in (
             self.top_bar,
@@ -1697,9 +1658,9 @@ class MacOSSubtitleOverlayApp:
         self.settings.transparent_bg = not self.settings.transparent_bg
         self.settings.save()
         self.btn_bg_mode.configure(
-            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板"
+            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 深色底板"
         )
-        self._apply_transparency_and_topmost()
+        self._apply_bg_colors()
 
     def _on_mouse_enter(self, _event=None) -> None:
         if self._hover_hide_job is not None:
@@ -1711,7 +1672,6 @@ class MacOSSubtitleOverlayApp:
         if not self._topbar_visible:
             self._topbar_visible = True
             self.top_bar.pack(fill=tk.X, side=tk.TOP, before=self.body)
-            self._sync_window_height()
 
     def _on_mouse_leave(self, _event=None) -> None:
         if self._is_running and self.settings.transparent_bg:
@@ -1727,44 +1687,12 @@ class MacOSSubtitleOverlayApp:
         if self._is_running and self.settings.transparent_bg and self._topbar_visible:
             self._topbar_visible = False
             self.top_bar.pack_forget()
-            self._sync_window_height()
-            self._assert_topmost()
-
-    def _sync_window_height(self) -> None:
-        try:
-            self.root.update_idletasks()
-            req_h = 20
-            if self.curr_subtitle_var.get():
-                req_h += self.curr_subtitle_label.winfo_reqheight() + 10
-            if self.prev_subtitle_var.get():
-                req_h += self.prev_subtitle_label.winfo_reqheight() + 8
-            if self._topbar_visible:
-                req_h += 40
-            needed_h = max(68, min(360, req_h))
-            cur_x = self.root.winfo_x()
-            cur_y = self.root.winfo_y()
-            self.root.geometry(f"{self._window_width}x{needed_h}+{cur_x}+{cur_y}")
-        except Exception:
-            pass
 
     def _update_subtitle_widgets(self, prev_txt: str, curr_txt: str) -> None:
-        old_prev = self.prev_subtitle_var.get()
-        old_curr = self.curr_subtitle_var.get()
-
-        if prev_txt:
+        if prev_txt != self.prev_subtitle_var.get():
             self.prev_subtitle_var.set(prev_txt)
-            if not old_prev:
-                self.prev_subtitle_label.pack(
-                    side=tk.TOP, fill=tk.X, pady=(0, 2), before=self.curr_subtitle_label
-                )
-        else:
-            if old_prev:
-                self.prev_subtitle_var.set("")
-                self.prev_subtitle_label.pack_forget()
-
-        if curr_txt != old_curr or prev_txt != old_prev:
+        if curr_txt != self.curr_subtitle_var.get():
             self.curr_subtitle_var.set(curr_txt)
-            self._sync_window_height()
 
     def _on_drag_start(self, event) -> None:
         self._drag_offset_x = event.x_root - self.root.winfo_x()
@@ -1782,11 +1710,10 @@ class MacOSSubtitleOverlayApp:
                 return
             self._is_running = True
             self.btn_toggle.configure(text="⏹ 停止", bg="#DC2626", activebackground="#B91C1C")
-            # 立即激活一次 5 秒倒计时提示，5 秒后无语音则自动清空屏幕
             prev_t, curr_t = self.display_ctrl.on_new_subtitle("正在监听系统音频…", is_final=True)
             self._update_subtitle_widgets(prev_t, curr_t)
             self.service.start()
-            self._assert_topmost()
+            configure_macos_window_non_hiding_once()
             if self.settings.transparent_bg:
                 self.root.after(2000, self._hide_topbar_for_pure_text)
         else:
@@ -1797,20 +1724,14 @@ class MacOSSubtitleOverlayApp:
 
     def _poll_ui_events(self) -> None:
         try:
-            # 1. 每 50ms 检查每句字幕是否满 5 秒，满 5 秒自动清空（包括当前字幕）
+            # 1. 每 50ms 检查每句字幕是否满 5 秒，满 5 秒立即自动清空
             if self.display_ctrl.check_expiration():
                 self._update_subtitle_widgets(
                     self.display_ctrl.prev_subtitle,
                     self.display_ctrl.curr_subtitle,
                 )
 
-            # 2. 每隔约 0.8 秒执行一次 Cocoa 窗口置顶防隐藏加固（确保切换浏览器绝不消失）
-            self._topmost_tick += 1
-            if self._topmost_tick >= 16:
-                self._topmost_tick = 0
-                self._assert_topmost()
-
-            # 3. 处理异步事件队列
+            # 2. 处理异步事件队列
             while True:
                 evt_type, payload = self.ui_queue.get_nowait()
                 if evt_type == "subtitle":
@@ -1858,7 +1779,6 @@ class MacOSSubtitleOverlayApp:
         win.geometry("560x560")
         win.configure(bg="#1E222B")
         win.attributes("-topmost", True)
-        win.transient(self.root)
 
         pad = {"padx": 16, "pady": 5}
 
@@ -1984,12 +1904,13 @@ class MacOSSubtitleOverlayApp:
             self.curr_subtitle_label.configure(font=("PingFang SC", self.settings.font_size, "bold"))
             self.prev_subtitle_label.configure(font=("PingFang SC", max(16, self.settings.font_size - 6), "bold"))
             self.btn_bg_mode.configure(
-                text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板"
+                text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 深色底板"
             )
-            self._apply_transparency_and_topmost()
+            self._apply_bg_colors()
             self.service.reload_runtime_params()
             win.destroy()
             self.status_label.configure(text="设置已保存并立即生效")
+            self.root.after(100, configure_macos_window_non_hiding_once)
 
         tk.Button(
             win,
@@ -2003,6 +1924,8 @@ class MacOSSubtitleOverlayApp:
             pady=6,
             cursor="hand2",
         ).pack(pady=12)
+
+        self.root.after(100, configure_macos_window_non_hiding_once)
 
     def _open_history_dialog(self) -> None:
         win = tk.Toplevel(self.root)
@@ -2024,6 +1947,7 @@ class MacOSSubtitleOverlayApp:
         content = "\n".join(self._history_lines) if self._history_lines else "暂无已归档的字幕记录。"
         txt.insert(tk.END, content)
         txt.configure(state=tk.DISABLED)
+        self.root.after(100, configure_macos_window_non_hiding_once)
 
     def _on_close(self) -> None:
         self.service.stop()
@@ -2037,7 +1961,7 @@ class MacOSSubtitleOverlayApp:
 # 8. 自检测试模式 (`--self-test`) 供自动化验证核心算法
 # ==============================================================================
 def run_self_test() -> int:
-    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.2.0) ===")
+    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.2.1) ===")
 
     # 1. 验证语气词与呻吟/喘息文本清洗器
     dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.82)
@@ -2049,12 +1973,10 @@ def run_self_test() -> int:
     # 2. 验证逐句换行切分 & 每句严格 5 秒自动清空逻辑
     disp = SubtitleDisplayStateController(expire_seconds=5.0, max_chars_per_line=20, max_visible_lines=2)
 
-    # 输入一段包含多句的长字幕：应当自动按句切分，且最多保留最近2句换行显示
     long_stream = "第一句简短的话。第二句是比较核心的内容！第三句正在实时流式输出"
     prev_t, curr_t = disp.on_new_subtitle(long_stream, is_final=False, now=100.0)
     assert prev_t == "第二句是比较核心的内容！" and curr_t == "第三句正在实时流式输出", f"逐句切分换行异常: prev={prev_t}, curr={curr_t}"
 
-    # 105.1 秒时（满 5 秒无新字幕），屏幕上所有字幕必须完全自动清空！
     changed = disp.check_expiration(now=105.1)
     assert changed and disp.prev_subtitle == "" and disp.curr_subtitle == "", (
         f"5秒后所有字幕应当完全清空: prev={disp.prev_subtitle}, curr={disp.curr_subtitle}"
