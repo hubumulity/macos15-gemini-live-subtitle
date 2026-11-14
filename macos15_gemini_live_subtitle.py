@@ -7,34 +7,18 @@ macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软�
 
 核心特性：
 1. 原生支持 macOS 15 (Sequoia) 系统音频内录：
-   - 模式 A（推荐，免装虚拟声卡）：自动编译并调用内嵌的 Swift `ScreenCaptureKit` 音频捕获器，
+   - 模式 A（推荐，免装虚拟声卡）：自动调用内置预编译的 Swift `ScreenCaptureKit` 音频捕获器，
      直接抓取 macOS 系统桌面音频并输出 16kHz 16-bit 单声道 PCM 流。
    - 模式 B（CoreAudio 虚拟声卡/输入设备）：支持 BlackHole 2ch、Loopback 或任意麦克风/聚合设备，
      内置实时重采样与声道下混。
-2. 三重语气词与喘息/呻吟声过滤引擎：
-   - 第一层（声学频谱门限 & 呼吸噪声过滤）：实时计算 RMS 能量、过零率 (ZCR) 与频谱平坦度
-     (Spectral Flatness) 及人声共振峰频带占比 (300Hz-3400Hz)，精准拦截宽频喘息声、叹气声、
-     麦克风吹气声与短促非语音呻吟。
-   - 第二层（Gemini 3.5 Live 系统级指令约束）：通过 `system_instruction` 与 `TranslationConfig`
-     指定 `target_language_code="zh-Hans"`，在模型生成侧抑制无意义语气词与非语义发声。
-   - 第三层（中英日多语种语气词正则清洗）：实时剔除字幕首尾及独立的“嗯、啊、哦、哎、呃、唔、哼、呀”
-     及 `[喘息]`、`(叹气)` 等非实质内容。
-3. 流式字幕防重复与去重算法 (Anti-Duplication Engine)：
-   - 针对 Live API 流式 `output_transcription` 增量分片，结合 `SequenceMatcher` 相似度比对、
-     首尾重叠合并 (Overlap Merging)、句内 N-gram 连续复读折叠（如“好的好的好的”->“好的”）以及
-     滑动时间窗历史去重，彻底消除静音或长句切换时的重复刷屏。
-4. 永不休眠与长间隙秒级唤醒 (Zero-Sleep & Instant Wakeup)：
-   - 进程级防休眠：自动启动 macOS `caffeinate -disu -w <pid>` 防止 macOS 15 App Nap 挂起后台线程。
-   - 预卷环形缓冲 (300ms Pre-roll Ring Buffer)：即使经过数小时静音，第一声人声出现前 300ms 的音频
-     也会完整送入模型，绝不吞字。
-   - 静音期零帧心跳保活 (Comfort-Silence Keepalive)：长间隙静音期停止推送环境底噪（防止模型幻觉输出），
-     每 8 秒发送一次微弱零电平保活帧维持 WebSocket 活跃。
-   - 无缝会话恢复 (`SessionResumptionConfig` + `ContextWindowCompressionConfig`)：突破 Live API
-     单次连接 10 分钟/15 分钟上下文限制，遇到 `go_away` 或网络闪断时自动携带 `new_handle` 秒级重连。
-5. 双界面引擎支持：
-   - 若系统安装了 `tkinter`，默认启动 macOS 原生置顶透明悬浮窗 (`--ui tk`)；
-   - 若未安装 `tkinter` 或指定 `--ui web`，自动启动零依赖毛玻璃悬浮字幕 Web HUD (`http://127.0.0.1:18765`)
-     并调用 macOS 独立 App 窗口模式打开。
+2. 纯透明悬浮字幕显示 & 5秒自动消隐防挤压布局：
+   - 原生支持 macOS 透明背景模式 (`-transparent` + `systemTransparent`)，默认无边框纯文字悬浮显示，
+     鼠标移入时自动浮现顶部控制栏，移出后自动隐藏，仅留清晰字幕文字。
+   - 历史字幕（上一行）在显示满 5.0 秒后自动消失并释放布局空间 (`pack_forget`)。
+   - 动态高度自适应引擎 (`_sync_window_height`)：根据新字幕行数实时动态扩展悬浮窗高度，确保新字幕
+     永远不会被历史字幕或窗口边界压缩、截断。
+3. 三重语气词与喘息/呻吟声过滤引擎 + 流式防重复去重算法。
+4. 永不休眠与长间隙秒级唤醒 (`caffeinate` + 300ms 预卷缓冲 + 8秒零帧心跳 + `SessionResumptionConfig`)。
 """
 
 from __future__ import annotations
@@ -57,12 +41,11 @@ import sys
 import threading
 import time
 from typing import Callable, Deque, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
 import webbrowser
 
 import numpy as np
 
-# 可选导入 Tkinter (兼容未安装 python-tk 的 Homebrew Python 环境)
+# 可选导入 Tkinter
 try:
     import tkinter as tk
     from tkinter import ttk
@@ -72,7 +55,7 @@ except ImportError:
     ttk = None
     HAS_TKINTER = False
 
-# 尝试导入 Google GenAI SDK (支持 Gemini 3.5 Live Translate)
+# 导入 Google GenAI SDK (支持 Gemini 3.5 Live Translate)
 try:
     from google import genai
     from google.genai import types
@@ -82,7 +65,7 @@ except ImportError:
     types = None
     HAS_GENAI_SDK = False
 
-# 尝试导入 SoundDevice / PyAudio 作为 CoreAudio 设备捕获后备
+# 可选导入 SoundDevice / PyAudio 作为 CoreAudio 设备捕获后备
 try:
     import sounddevice as sd
     HAS_SOUNDDEVICE = True
@@ -116,14 +99,17 @@ SWIFT_HELPER_BIN = SWIFT_HELPER_DIR / "sck_audio_helper"
 # Gemini Live API 音频规范：输入必须为 16kHz, 16-bit, 单声道小端 PCM
 TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
-SAMPLE_WIDTH_BYTES = 2  # int16 = 2 bytes
-CHUNK_DURATION_MS = 100  # 官方推荐 100ms 分片
+SAMPLE_WIDTH_BYTES = 2
+CHUNK_DURATION_MS = 100
 CHUNK_SAMPLES = int(TARGET_SAMPLE_RATE * CHUNK_DURATION_MS / 1000)  # 1600 samples
 CHUNK_BYTES = CHUNK_SAMPLES * SAMPLE_WIDTH_BYTES  # 3200 bytes
 
 DEFAULT_MODEL = "gemini-3.5-live-translate-preview"
 FALLBACK_MODEL = "gemini-3.1-flash-live-preview"
-TARGET_LANGUAGE_BCP47 = "zh-Hans"  # 简体中文官方 BCP-47 代码
+TARGET_LANGUAGE_BCP47 = "zh-Hans"
+
+# 历史字幕自动消失时间（秒）
+HISTORY_EXPIRE_SECONDS = 5.0
 
 
 # ==============================================================================
@@ -233,13 +219,15 @@ if #available(macOS 13.0, *) {
 class AppSettings:
     api_key: str = ""
     model_name: str = DEFAULT_MODEL
-    capture_backend: str = "auto"  # "auto", "screencapturekit", "audio_device"
-    audio_device_name: str = ""    # 指定 BlackHole 2ch 等设备名（为空则自动匹配）
+    capture_backend: str = "auto"         # "auto", "screencapturekit", "audio_device"
+    audio_device_name: str = ""           # 指定 BlackHole 2ch 等设备名
     vad_rms_threshold: float = 0.008      # 语音激活 RMS 阈值
     breath_filter_strength: float = 0.65  # 喘息/呻吟频谱过滤强度 (0.0 ~ 1.0)
     dedup_similarity: float = 0.82        # 重复字幕判定阈值
-    font_size: int = 24
-    window_alpha: float = 0.88
+    font_size: int = 26
+    transparent_bg: bool = True           # 默认开启背景纯透明（只显示文字）
+    history_Addressing_sec: float = 5.0   # 历史字幕自动消失秒数（默认 5 秒）
+    window_alpha: float = 0.92
     show_bilingual: bool = False          # 是否同时显示源语言识别文本
     echo_target_language: bool = False    # 当源音频本身是中文时是否复述
 
@@ -289,9 +277,7 @@ class AcousticSpeechFilter:
         self.rms_threshold = rms_threshold
         self.breath_filter_strength = breath_filter_strength
 
-        # 300ms 预卷缓冲 (3 个 100ms 分片)
         self.preroll_buffer: Deque[bytes] = deque(maxlen=3)
-        # 语音尾部保持帧数 (Hangover: 1.2 秒 = 12 个 100ms 分片，防止句中停顿被切断)
         self.hangover_max_frames = 12
         self.hangover_counter = 0
         self.in_speech_segment = False
@@ -302,17 +288,12 @@ class AcousticSpeechFilter:
         self.breath_filter_strength = min(1.0, max(0.0, float(breath_filter_strength)))
 
     def analyze_chunk(self, pcm16_bytes: bytes) -> Tuple[bool, List[bytes], dict]:
-        """
-        分析单个 100ms PCM16 音频块。
-        返回: (should_send_audio, chunks_to_send, metrics_dict)
-        """
         if len(pcm16_bytes) < 4:
             return False, [], {"rms": 0.0, "is_speech": False, "reason": "empty"}
 
         samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
 
-        # 1. 能量门限检测
         if rms < self.rms_threshold:
             self.consecutive_voiced_frames = 0
             if self.in_speech_segment and self.hangover_counter > 0:
@@ -322,20 +303,17 @@ class AcousticSpeechFilter:
             self.preroll_buffer.append(pcm16_bytes)
             return False, [], {"rms": rms, "is_speech": False, "reason": "silence"}
 
-        # 2. 频谱特征计算：区分清晰语音 vs 喘息/吹气/无意义呻吟
         zero_crossings = float(np.mean(np.abs(np.diff(np.signbit(samples)))))
 
         windowed = samples * np.hanning(len(samples))
         mag_spectrum = np.abs(np.fft.rfft(windowed)) + 1e-10
         freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate)
 
-        # 频谱平坦度 (Spectral Flatness = 几何平均 / 算术平均)
         log_mean = float(np.mean(np.log(mag_spectrum)))
         geom_mean = math.exp(log_mean)
         arith_mean = float(np.mean(mag_spectrum))
         spectral_flatness = geom_mean / (arith_mean + 1e-10)
 
-        # 核心人声共振峰频带能量比 (300Hz ~ 3400Hz 占总能量比例)
         total_energy = float(np.sum(mag_spectrum ** 2)) + 1e-10
         speech_band_mask = (freqs >= 300.0) & (freqs <= 3400.0)
         low_rumble_mask = freqs < 220.0
@@ -365,7 +343,6 @@ class AcousticSpeechFilter:
                 return True, [silent_replacement], {"rms": rms, "is_speech": False, "reason": reason}
             return False, [], {"rms": rms, "is_speech": False, "reason": reason}
 
-        # 3. 确认是有效人声
         self.consecutive_voiced_frames += 1
         self.hangover_counter = self.hangover_max_frames
 
@@ -382,13 +359,6 @@ class AcousticSpeechFilter:
 # 4. 文本后处理：语气词/呻吟词过滤 + 流式防重复去重引擎
 # ==============================================================================
 class SubtitleCleanerAndDeduplicator:
-    """
-    负责对 Gemini 3.5 Live Translate 返回的简体中文字幕进行：
-    1. 语气词（嗯、啊、哦、哎、呃、唔、哼、哈等）及声学描述标签（[喘息]、(叹气)）剥离；
-    2. 句内连续重复词/短语折叠（防止模型复读）；
-    3. 流式分片拼接与跨句滑动窗口相似度去重。
-    """
-
     NON_VERBAL_TAG_RE = re.compile(
         r"[\[\(（【]\s*(?:喘息|喘气|呻吟|叹气|呼吸|呼吸声|急促呼吸|娇喘|闷哼|哼声|咳嗽|清嗓|"
         r"笑声|哭声|杂音|噪音|音乐|背景音|静音|空白|sigh|groan|panting|breathing|moan|laugh|noise|music)\s*[\]\)）】]",
@@ -532,6 +502,69 @@ class SubtitleCleanerAndDeduplicator:
 
 
 # ==============================================================================
+# 4B. 字幕显示状态控制器：管理 5 秒历史消隐与新字幕防压缩截断
+# ==============================================================================
+class SubtitleDisplayStateController:
+    """
+    负责管理悬浮窗的双行字幕生命周期：
+    - 历史字幕 (`prev_subtitle`) 单行摘要化（防止多行历史字幕挤压新字幕空间）；
+    - 历史字幕满 5.0 秒自动清空消失；
+    - 新字幕 (`curr_subtitle`) 永不截断，完整返回给自适应高度悬浮窗展示。
+    """
+
+    def __init__(self, expire_seconds: float = HISTORY_EXPIRE_SECONDS, max_history_chars: int = 44) -> None:
+        self.expire_seconds = float(expire_seconds)
+        self.max_history_chars = max_history_chars
+        self.prev_subtitle: str = ""
+        self.prev_timestamp: float = 0.0
+        self.curr_subtitle: str = ""
+        self.curr_timestamp: float = 0.0
+        self.curr_is_final: bool = False
+
+    def on_new_subtitle(self, zh_text: str, src_text: str = "", show_bilingual: bool = False, is_final: bool = False, now: Optional[float] = None) -> Tuple[str, str]:
+        now_ts = time.monotonic() if now is None else now
+        display_curr = f"{zh_text}\n[{src_text}]" if (show_bilingual and src_text) else zh_text
+
+        if is_final:
+            # 若此前已有归档完结的旧句，将其转为单行历史字幕并启动 5 秒倒计时
+            if self.curr_subtitle and self.curr_is_final and self.curr_subtitle != display_curr:
+                self._promote_to_history(self.curr_subtitle, now_ts)
+            self.curr_subtitle = display_curr
+            self.curr_timestamp = now_ts
+            self.curr_is_final = True
+        else:
+            # 正在流式生成新句时，如果上一句已是 final，将上一句移入历史字幕（5秒后自动消失）
+            if self.curr_subtitle and self.curr_is_final:
+                self._promote_to_history(self.curr_subtitle, now_ts)
+                self.curr_is_final = False
+            self.curr_subtitle = display_curr
+            self.curr_timestamp = now_ts
+
+        self.check_expiration(now_ts)
+        return self.prev_subtitle, self.curr_subtitle
+
+    def _promote_to_history(self, text: str, now_ts: float) -> None:
+        single_line = text.split("\n")[0].strip()
+        if len(single_line) > self.max_history_chars:
+            single_line = "…" + single_line[-(self.max_history_chars - 1):]
+        self.prev_subtitle = single_line
+        self.prev_timestamp = now_ts
+
+    def check_expiration(self, now: Optional[float] = None) -> bool:
+        """
+        检查历史字幕是否已满 5 秒需要自动消失。
+        返回 True 表示状态发生了变更（需要刷新 UI 并收缩历史字幕行）。
+        """
+        now_ts = time.monotonic() if now is None else now
+        changed = False
+        if self.prev_subtitle and (now_ts - self.prev_timestamp) >= self.expire_seconds:
+            self.prev_subtitle = ""
+            self.prev_timestamp = 0.0
+            changed = True
+        return changed
+
+
+# ==============================================================================
 # 5. macOS 15 系统音频捕获统一管理器 (ScreenCaptureKit + CoreAudio 双引擎)
 # ==============================================================================
 class MacOSAudioCaptureManager:
@@ -539,6 +572,7 @@ class MacOSAudioCaptureManager:
         self.settings = settings
         self.running = False
         self._sck_proc: Optional[subprocess.Popen] = None
+        self._sck_bin_path: str = str(SWIFT_HELPER_BIN)
         self._reader_thread: Optional[threading.Thread] = None
 
     @staticmethod
@@ -546,7 +580,7 @@ class MacOSAudioCaptureManager:
         if sys.platform != "darwin":
             return False, "当前非 macOS 系统，无法编译 ScreenCaptureKit 组件。"
 
-        # 若处于 PyInstaller 打包后的 macOS .app 环境，优先使用内置预编译好的二进制
+        # 优先查找 PyInstaller (--onefile / --onedir) 打包内置的预编译二进制，无需用户机器存在 py/swift 源码
         bundled_candidates = []
         if getattr(sys, "frozen", False):
             meipass = Path(getattr(sys, "_MEIPASS", ""))
@@ -660,7 +694,7 @@ class MacOSAudioCaptureManager:
                     if self._sck_proc.stderr:
                         err_out = self._sck_proc.stderr.read().decode("utf-8", errors="replace").strip()
                     if "permission" in err_out.lower() or "denied" in err_out.lower():
-                        on_error("请在「系统设置 -> 隐私与安全性 -> 录屏与系统录音」中授予终端/Python 权限。")
+                        on_error("请在「系统设置 -> 隐私与安全性 -> 录屏与系统录音」中授予本应用权限。")
                         break
                     time.sleep(1.0)
             except Exception as exc:
@@ -817,7 +851,7 @@ class GeminiLiveTranslateService:
         if self._running:
             return
         if not self.settings.api_key.strip():
-            self.on_status_change("未配置 API Key，请点击右上角「设置」填入", "#FF6B6B")
+            self.on_status_change("未配置 API Key，请点击「设置」填入", "#FF6B6B")
             return
         if not HAS_GENAI_SDK:
             self.on_status_change("缺少 google-genai 依赖，请先运行安装脚本", "#FF6B6B")
@@ -851,7 +885,6 @@ class GeminiLiveTranslateService:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                logger.info("已启用 macOS caffeinate 防休眠守护 (PID=%s)", os.getpid())
             except Exception as exc:
                 logger.warning("启动 caffeinate 失败: %s", exc)
 
@@ -956,7 +989,7 @@ class GeminiLiveTranslateService:
                 async with client.aio.live.connect(model=active_model, config=config) as session:
                     backoff = 0.5
                     self.on_status_change(
-                        f"实时翻译运行中 · {active_model} · {capture_desc}",
+                        f"实时翻译中 · {active_model}",
                         "#4CAF50",
                     )
 
@@ -986,11 +1019,10 @@ class GeminiLiveTranslateService:
                 if "1007" in err_str or "invalid" in err_str.lower() or "resumption" in err_str.lower():
                     self._resumption_handle = None
                 if "not found" in err_str.lower() and active_model == DEFAULT_MODEL:
-                    logger.info("自动尝试备用实时模型 %s", FALLBACK_MODEL)
                     active_model = FALLBACK_MODEL
 
                 self.on_status_change(
-                    f"连接自动恢复中 ({backoff:.1f}s) · 音频缓冲保护中...",
+                    f"连接自动恢复中 ({backoff:.1f}s)...",
                     "#FFB74D",
                 )
                 await asyncio.sleep(backoff)
@@ -1052,7 +1084,6 @@ class GeminiLiveTranslateService:
 
                 go_away = getattr(response, "go_away", None)
                 if go_away is not None:
-                    logger.info("收到服务端 GoAway 轮转通知，准备无缝切换新连接...")
                     return
 
                 server_content = getattr(response, "server_content", None)
@@ -1081,7 +1112,7 @@ class GeminiLiveTranslateService:
 
 
 # ==============================================================================
-# 7A. 零依赖本地 Web HUD 悬浮字幕界面 (兼容未安装 tkinter 的 macOS Python 环境)
+# 7A. 零依赖本地 Web HUD 悬浮字幕界面 (支持透明背景、5秒历史消隐与新字幕自适应高度)
 # ==============================================================================
 WEB_HUD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1089,116 +1120,87 @@ WEB_HUD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8" />
 <title>Gemini 3.5 Live 实时中文字幕 (macOS 15)</title>
 <style>
-  :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", sans-serif;
-    background: #0f1218;
-    color: #f8fafc;
+    background: transparent;
+    color: #ffffff;
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    overflow: hidden;
+    min-height: 100vh;
+    overflow-x: hidden;
   }
+  body.solid-bg { background: rgba(15, 18, 24, 0.88); }
   .topbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: #181c24;
-    padding: 8px 16px;
-    border-bottom: 1px solid #262c3a;
-    font-size: 13px;
+    background: rgba(24, 28, 36, 0.92);
+    padding: 6px 14px;
+    border-radius: 8px;
+    margin: 6px 12px 0 12px;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity 0.25s ease;
   }
+  body:hover .topbar, .topbar.pinned { opacity: 1; }
   .status-wrap { display: flex; align-items: center; gap: 8px; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa0a6; }
-  .controls { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #9aa0a6; }
+  .controls { display: flex; align-items: center; gap: 6px; }
   button {
     background: #262c3a; color: #f8fafc; border: none; border-radius: 6px;
-    padding: 5px 12px; font-size: 12px; cursor: pointer; font-weight: 500;
+    padding: 4px 10px; font-size: 12px; cursor: pointer; font-weight: 500;
   }
   button.primary { background: #2563eb; font-weight: 600; }
   button.danger { background: #dc2626; font-weight: 600; }
   .subtitle-stage {
-    flex: 1; display: flex; flex-direction: column; justify-content: center;
-    align-items: center; padding: 18px 28px; text-align: center;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding: 10px 24px 18px 24px;
+    text-align: center;
   }
-  .prev-line { color: #94a3b8; font-size: 17px; margin-bottom: 10px; min-height: 24px; }
+  .prev-line {
+    color: #cbd5e1;
+    font-size: 18px;
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 92vw;
+    text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 2px 8px rgba(0,0,0,0.95);
+    transition: opacity 0.3s ease;
+  }
+  .prev-line:empty { display: none; margin: 0; }
   .curr-line {
-    color: #ffffff; font-size: 26px; font-weight: 700; line-height: 1.4;
-    text-shadow: 0 2px 10px rgba(0,0,0,0.65);
-  }
-  .modal {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.75);
-    display: none; align-items: center; justify-content: center;
-  }
-  .modal.open { display: flex; }
-  .modal-card {
-    background: #1a1f29; border: 1px solid #2e3646; border-radius: 10px;
-    width: 480px; max-width: 92vw; padding: 20px;
-  }
-  .modal-card h3 { margin-bottom: 12px; font-size: 16px; }
-  .field { margin-bottom: 12px; }
-  .field label { display: block; font-size: 12px; color: #cbd5e1; margin-bottom: 4px; }
-  .field input, .field select {
-    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #334155;
-    background: #0f172a; color: #f8fafc; font-size: 13px;
+    color: #ffffff;
+    font-size: 28px;
+    font-weight: 800;
+    line-height: 1.42;
+    word-break: break-word;
+    max-width: 95vw;
+    text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 3px 12px rgba(0,0,0,0.98);
   }
 </style>
 </head>
 <body>
-  <div class="topbar">
+  <div id="topbar" class="topbar pinned">
     <div class="status-wrap">
       <div id="dot" class="dot"></div>
-      <span id="statusText">就绪 · 点击「开始实时翻译」捕获 macOS 系统音频</span>
+      <span id="statusText">就绪 · 鼠标移开自动隐藏控制栏，仅显示透明字幕文字</span>
     </div>
     <div class="controls">
-      <span id="vadBadge" style="color:#94a3b8;font-size:12px;margin-right:8px;">静音热备 (防休眠)</span>
+      <span id="vadBadge" style="color:#94a3b8;font-size:12px;margin-right:6px;">静音热备</span>
       <button id="toggleBtn" class="primary" onclick="toggleRun()">▶ 开始实时翻译</button>
-      <button onclick="openSettings()">⚙ API Key 与过滤设置</button>
+      <button onclick="document.body.classList.toggle('solid-bg')">🔲 切换透明/底板</button>
     </div>
   </div>
   <div class="subtitle-stage">
     <div id="prevLine" class="prev-line"></div>
-    <div id="currLine" class="curr-line">等待系统音频输入…（已开启语气词/喘息声过滤与防重复保护）</div>
+    <div id="currLine" class="curr-line">等待系统音频输入…</div>
   </div>
-
-  <div id="settingsModal" class="modal">
-    <div class="modal-card">
-      <h3>自定义 API Key 与音频过滤设置</h3>
-      <div class="field">
-        <label>Google AI Studio API Key (支持免费层级密钥):</label>
-        <input id="apiKeyInput" type="password" placeholder="粘贴 AIzaSy... 密钥" />
-      </div>
-      <div class="field">
-        <label>实时翻译模型:</label>
-        <select id="modelInput">
-          <option value="gemini-3.5-live-translate-preview">gemini-3.5-live-translate-preview</option>
-          <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>macOS 15 音频捕获引擎:</label>
-        <select id="backendInput">
-          <option value="auto">auto (优先 ScreenCaptureKit 原生内录)</option>
-          <option value="screencapturekit">screencapturekit (macOS 15 免虚拟声卡)</option>
-          <option value="audio_device">audio_device (BlackHole / CoreAudio)</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>语气词与喘息/呻吟过滤强度 (0.1 ~ 0.95，推荐 0.65):</label>
-        <input id="breathInput" type="number" step="0.05" min="0.1" max="0.95" value="0.65" />
-      </div>
-      <div class="field">
-        <label>防重复字幕相似度阈值 (0.60 ~ 0.95，推荐 0.82):</label>
-        <input id="dedupInput" type="number" step="0.02" min="0.60" max="0.95" value="0.82" />
-      </div>
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
-        <button onclick="closeSettings()">取消</button>
-        <button class="primary" onclick="saveSettings()">💾 保存并生效</button>
-      </div>
-    </div>
-  </div>
-
 <script>
 let isRunning = false;
 async function pollState() {
@@ -1208,48 +1210,19 @@ async function pollState() {
     document.getElementById('statusText').textContent = d.status_text;
     document.getElementById('dot').style.background = d.status_color;
     document.getElementById('vadBadge').textContent = d.vad_text;
-    if (d.prev_subtitle) document.getElementById('prevLine').textContent = d.prev_subtitle;
-    if (d.curr_subtitle) document.getElementById('currLine').textContent = d.curr_subtitle;
+    document.getElementById('prevLine').textContent = d.prev_subtitle || '';
+    document.getElementById('currLine').textContent = d.curr_subtitle || '';
     isRunning = d.is_running;
+    const tb = document.getElementById('topbar');
+    if (isRunning) tb.classList.remove('pinned');
     const btn = document.getElementById('toggleBtn');
-    btn.textContent = isRunning ? '⏹ 停止翻译' : '▶ 开始实时翻译';
+    btn.textContent = isRunning ? '⏹ 停止' : '▶ 开始实时翻译';
     btn.className = isRunning ? 'danger' : 'primary';
   } catch (e) {}
 }
-setInterval(pollState, 120);
-
+setInterval(pollState, 100);
 async function toggleRun() {
-  const r = await fetch('/api/toggle', { method: 'POST' });
-  const d = await r.json();
-  if (d.need_api_key) openSettings();
-}
-async function openSettings() {
-  const r = await fetch('/api/settings');
-  const s = await r.json();
-  document.getElementById('apiKeyInput').value = s.api_key || '';
-  document.getElementById('modelInput').value = s.model_name || 'gemini-3.5-live-translate-preview';
-  document.getElementById('backendInput').value = s.capture_backend || 'auto';
-  document.getElementById('breathInput').value = s.breath_filter_strength ?? 0.65;
-  document.getElementById('dedupInput').value = s.dedup_similarity ?? 0.82;
-  document.getElementById('settingsModal').classList.add('open');
-}
-function closeSettings() {
-  document.getElementById('settingsModal').classList.remove('open');
-}
-async function saveSettings() {
-  const body = {
-    api_key: document.getElementById('apiKeyInput').value.trim(),
-    model_name: document.getElementById('modelInput').value,
-    capture_backend: document.getElementById('backendInput').value,
-    breath_filter_strength: parseFloat(document.getElementById('breathInput').value || '0.65'),
-    dedup_similarity: parseFloat(document.getElementById('dedupInput').value || '0.82'),
-  };
-  await fetch('/api/settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  closeSettings();
+  await fetch('/api/toggle', { method: 'POST' });
 }
 </script>
 </body>
@@ -1258,18 +1231,17 @@ async function saveSettings() {
 
 
 class WebHudSubtitleApp:
-    """当系统未安装 python-tk 时自动启用的零依赖 Web HUD 字幕悬浮窗服务。"""
-
     def __init__(self, port: int = 18765) -> None:
         self.port = port
         self.settings = AppSettings.load()
+        self.display_ctrl = SubtitleDisplayStateController(expire_seconds=HISTORY_EXPIRE_SECONDS)
         self.state = {
             "is_running": False,
             "status_text": "就绪 · 点击「开始实时翻译」捕获 macOS 系统音频",
             "status_color": "#9AA0A6",
             "vad_text": "静音热备 (防休眠)",
             "prev_subtitle": "",
-            "curr_subtitle": "等待系统音频输入…（已开启语气词/喘息声过滤与防重复保护）",
+            "curr_subtitle": "等待系统音频输入…",
         }
         self.service = GeminiLiveTranslateService(
             settings=self.settings,
@@ -1279,24 +1251,28 @@ class WebHudSubtitleApp:
         )
 
     def _on_subtitle(self, zh_text: str, src_text: str, is_final: bool) -> None:
-        if is_final:
-            self.state["prev_subtitle"] = zh_text
-        self.state["curr_subtitle"] = zh_text
+        prev_txt, curr_txt = self.display_ctrl.on_new_subtitle(
+            zh_text, src_text, self.settings.show_bilingual, is_final
+        )
+        self.state["prev_subtitle"] = prev_txt
+        self.state["curr_subtitle"] = curr_txt
 
     def _on_status(self, msg: str, color: str) -> None:
         self.state["status_text"] = msg
         self.state["status_color"] = color
 
     def _on_level(self, rms: float, reason: str) -> None:
+        if self.display_ctrl.check_expiration():
+            self.state["prev_subtitle"] = self.display_ctrl.prev_subtitle
         bars = min(8, int(rms * 160))
         meter = "▮" * bars + "▯" * (8 - bars)
         reason_map = {
             "speech_active": "人声翻译中",
-            "speech_onset": "唤醒捕捉 (含300ms预卷)",
+            "speech_onset": "唤醒捕捉",
             "hangover": "句尾延续",
-            "breath_filtered": "已过滤喘息/呼吸声",
-            "groan_filtered": "已过滤低频呻吟",
-            "silence": "静音热备 (零帧保活)",
+            "breath_filtered": "已过滤喘息声",
+            "groan_filtered": "已过滤呻吟声",
+            "silence": "静音热备",
         }
         self.state["vad_text"] = f"{meter} {reason_map.get(reason, '监听中')}"
 
@@ -1309,15 +1285,12 @@ class WebHudSubtitleApp:
 
             def do_GET(self):
                 if self.path == "/api/state":
+                    if app_ref.display_ctrl.check_expiration():
+                        app_ref.state["prev_subtitle"] = app_ref.display_ctrl.prev_subtitle
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.end_headers()
                     self.wfile.write(json.dumps(app_ref.state, ensure_ascii=False).encode("utf-8"))
-                elif self.path == "/api/settings":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(app_ref.settings.__dict__, ensure_ascii=False).encode("utf-8"))
                 else:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1327,29 +1300,11 @@ class WebHudSubtitleApp:
             def do_POST(self):
                 if self.path == "/api/toggle":
                     if not app_ref.state["is_running"]:
-                        if not app_ref.settings.api_key.strip():
-                            self.send_response(200)
-                            self.send_header("Content-Type", "application/json")
-                            self.end_headers()
-                            self.wfile.write(b'{"need_api_key": true}')
-                            return
                         app_ref.state["is_running"] = True
                         app_ref.service.start()
                     else:
                         app_ref.state["is_running"] = False
                         app_ref.service.stop()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"need_api_key": false}')
-                elif self.path == "/api/settings":
-                    length = int(self.headers.get("Content-Length", "0"))
-                    body = json.loads(self.rfile.read(length).decode("utf-8"))
-                    for k, v in body.items():
-                        if hasattr(app_ref.settings, k):
-                            setattr(app_ref.settings, k, v)
-                    app_ref.settings.save()
-                    app_ref.service.reload_runtime_params()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -1366,31 +1321,39 @@ class WebHudSubtitleApp:
 
 
 # ==============================================================================
-# 7B. macOS 15 悬浮毛玻璃感字幕 HUD 界面 (Tkinter 原生置顶窗口)
+# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (只显示文字 + 历史5秒自动消失 + 新字幕自适应高度防压缩)
 # ==============================================================================
 class MacOSSubtitleOverlayApp:
+    """
+    针对 macOS 15 深度优化的原生悬浮字幕窗口：
+    1. 支持背景纯透明 (`systemTransparent` + 无边框模式)，鼠标移走后自动隐藏顶部工具栏，只显示字幕文字；
+    2. 历史字幕显示满 5 秒后自动消失并释放空间 (`pack_forget`)；
+    3. 动态自适应窗口高度 (`_sync_window_height`)：新字幕无论多长都会自动撑开显示空间，绝不被压缩截断。
+    """
+
     def __init__(self) -> None:
         self.settings = AppSettings.load()
         self.ui_queue: "queue.Queue[Tuple[str, tuple]]" = queue.Queue()
+        self.display_ctrl = SubtitleDisplayStateController(expire_seconds=HISTORY_EXPIRE_SECONDS)
 
         self.root = tk.Tk()
-        self.root.title("Gemini 3.5 Live 实时中文字幕 (macOS 15)")
-        self.root.geometry("920x210+220+680")
-        self.root.minsize(560, 140)
-        self.root.configure(bg="#121417")
+        self.root.title("Gemini 3.5 Live 实时中文字幕")
+        self._window_width = 960
+        self.root.geometry(f"{self._window_width}x150+200+700")
+        self.root.minsize(560, 80)
 
+        # 置顶属性
         self.root.attributes("-topmost", True)
-        try:
-            self.root.attributes("-alpha", self.settings.window_alpha)
-        except tk.TclError:
-            pass
 
         self._drag_offset_x = 0
         self._drag_offset_y = 0
         self._is_running = False
+        self._topbar_visible = True
+        self._hover_hide_job: Optional[str] = None
         self._history_lines: Deque[str] = deque(maxlen=200)
 
         self._build_ui()
+        self._apply_transparency_mode()
 
         self.service = GeminiLiveTranslateService(
             settings=self.settings,
@@ -1399,34 +1362,65 @@ class MacOSSubtitleOverlayApp:
             on_audio_level=lambda rms, reason: self.ui_queue.put(("level", (rms, reason))),
         )
 
-        self.root.after(40, self._poll_ui_events)
+        self.root.after(50, self._poll_ui_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if not self.settings.api_key:
             self.root.after(300, self._open_settings_dialog)
 
-    def _build_ui(self) -> None:
-        top_bar = tk.Frame(self.root, bg="#1A1D24", height=36)
-        top_bar.pack(fill=tk.X, side=tk.TOP)
+    def _get_bg_color(self) -> str:
+        """在 macOS 下启用透明背景时使用 Aqua 原生 systemTransparent。"""
+        if self.settings.transparent_bg and sys.platform == "darwin":
+            return "systemTransparent"
+        return "#121417"
 
-        top_bar.bind("<ButtonPress-1>", self._on_drag_start)
-        top_bar.bind("<B1-Motion>", self._on_drag_motion)
+    def _apply_transparency_mode(self) -> None:
+        bg_color = self._get_bg_color()
+        if sys.platform == "darwin":
+            try:
+                if self.settings.transparent_bg:
+                    # 启用无边框 + 原生透明背景（只显示文字，不显示灰黑底框）
+                    self.root.overrideredirect(True)
+                    self.root.wm_attributes("-transparent", True)
+                    self.root.attributes("-alpha", 1.0)
+                else:
+                    self.root.overrideredirect(False)
+                    self.root.wm_attributes("-transparent", False)
+                    self.root.attributes("-alpha", self.settings.window_alpha)
+            except tk.TclError:
+                pass
+        else:
+            try:
+                self.root.attributes("-alpha", self.settings.window_alpha)
+            except tk.TclError:
+                pass
+
+        self.root.configure(bg=bg_color)
+        self.body.configure(bg=bg_color)
+        self.prev_subtitle_label.configure(bg=bg_color)
+        self.curr_subtitle_label.configure(bg=bg_color)
+        self._sync_window_height()
+
+    def _build_ui(self) -> None:
+        bg_color = self._get_bg_color()
+
+        # 顶部控制栏（鼠标移入显示，移出且翻译运行时自动隐藏，保证只显示文字）
+        self.top_bar = tk.Frame(self.root, bg="#1A1D24", height=34)
+        self.top_bar.pack(fill=tk.X, side=tk.TOP)
 
         self.status_dot = tk.Label(
-            top_bar, text="●", fg="#9AA0A6", bg="#1A1D24", font=("PingFang SC", 12, "bold")
+            self.top_bar, text="●", fg="#9AA0A6", bg="#1A1D24", font=("PingFang SC", 12, "bold")
         )
-        self.status_dot.pack(side=tk.LEFT, padx=(12, 4), pady=4)
+        self.status_dot.pack(side=tk.LEFT, padx=(10, 4), pady=3)
 
         self.status_label = tk.Label(
-            top_bar,
-            text="就绪 · 点击「开始实时翻译」捕获 macOS 系统音频",
+            self.top_bar,
+            text="就绪 · 可直接拖动文字移动位置，开始翻译后工具栏自动隐去",
             fg="#CBD5E1",
             bg="#1A1D24",
             font=("PingFang SC", 11),
         )
-        self.status_label.pack(side=tk.LEFT, padx=4, pady=4)
-        self.status_label.bind("<ButtonPress-1>", self._on_drag_start)
-        self.status_label.bind("<B1-Motion>", self._on_drag_motion)
+        self.status_label.pack(side=tk.LEFT, padx=4, pady=3)
 
         btn_style = {
             "bg": "#262B36",
@@ -1434,83 +1428,179 @@ class MacOSSubtitleOverlayApp:
             "activebackground": "#3B4252",
             "activeforeground": "#FFFFFF",
             "bd": 0,
-            "padx": 10,
-            "pady": 3,
+            "padx": 8,
+            "pady": 2,
             "font": ("PingFang SC", 11),
             "cursor": "hand2",
         }
 
-        self.btn_settings = tk.Button(
-            top_bar, text="⚙ API Key 与过滤设置", command=self._open_settings_dialog, **btn_style
+        self.btn_quit = tk.Button(
+            self.top_bar, text="✕", command=self._on_close, **btn_style
         )
-        self.btn_settings.pack(side=tk.RIGHT, padx=(4, 10), pady=4)
+        self.btn_quit.pack(side=tk.RIGHT, padx=(2, 8), pady=3)
+
+        self.btn_settings = tk.Button(
+            self.top_bar, text="⚙ 设置", command=self._open_settings_dialog, **btn_style
+        )
+        self.btn_settings.pack(side=tk.RIGHT, padx=3, pady=3)
+
+        self.btn_bg_mode = tk.Button(
+            self.top_bar,
+            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板",
+            command=self._toggle_bg_mode,
+            **btn_style,
+        )
+        self.btn_bg_mode.pack(side=tk.RIGHT, padx=3, pady=3)
 
         self.btn_history = tk.Button(
-            top_bar, text="📜 字幕记录", command=self._open_history_dialog, **btn_style
+            self.top_bar, text="📜 记录", command=self._open_history_dialog, **btn_style
         )
-        self.btn_history.pack(side=tk.RIGHT, padx=4, pady=4)
+        self.btn_history.pack(side=tk.RIGHT, padx=3, pady=3)
 
         self.btn_toggle = tk.Button(
-            top_bar,
-            text="▶ 开始实时翻译",
+            self.top_bar,
+            text="▶ 开始翻译",
             command=self._toggle_translation,
             bg="#2563EB",
             fg="#FFFFFF",
             activebackground="#1D4ED8",
             activeforeground="#FFFFFF",
             bd=0,
-            padx=12,
-            pady=3,
+            padx=10,
+            pady=2,
             font=("PingFang SC", 11, "bold"),
             cursor="hand2",
         )
-        self.btn_toggle.pack(side=tk.RIGHT, padx=4, pady=4)
+        self.btn_toggle.pack(side=tk.RIGHT, padx=3, pady=3)
 
         self.vad_badge = tk.Label(
-            top_bar,
-            text="静音待命 (防休眠热备)",
+            self.top_bar,
+            text="静音待命",
             fg="#94A3B8",
             bg="#1A1D24",
             font=("PingFang SC", 10),
         )
-        self.vad_badge.pack(side=tk.RIGHT, padx=10, pady=4)
+        self.vad_badge.pack(side=tk.RIGHT, padx=8, pady=3)
 
-        body = tk.Frame(self.root, bg="#121417", padx=20, pady=12)
-        body.pack(fill=tk.BOTH, expand=True)
-        body.bind("<ButtonPress-1>", self._on_drag_start)
-        body.bind("<B1-Motion>", self._on_drag_motion)
+        # 字幕主显示区
+        self.body = tk.Frame(self.root, bg=bg_color, padx=16, pady=6)
+        self.body.pack(fill=tk.BOTH, expand=True)
 
+        # 历史字幕（默认不挂载 pack，仅有内容时挂载，满 5 秒后自动 pack_forget 彻底释放空间）
         self.prev_subtitle_var = tk.StringVar(value="")
         self.prev_subtitle_label = tk.Label(
-            body,
+            self.body,
             textvariable=self.prev_subtitle_var,
-            fg="#94A3B8",
-            bg="#121417",
-            font=("PingFang SC", max(14, self.settings.font_size - 6)),
-            wraplength=860,
+            fg="#CBD5E1",
+            bg=bg_color,
+            font=("PingFang SC", max(15, self.settings.font_size - 8), "bold"),
+            wraplength=self._window_width - 40,
             justify=tk.CENTER,
         )
-        self.prev_subtitle_label.pack(fill=tk.X, pady=(0, 6))
-        self.prev_subtitle_label.bind("<ButtonPress-1>", self._on_drag_start)
-        self.prev_subtitle_label.bind("<B1-Motion>", self._on_drag_motion)
 
+        # 当前实时新字幕（高对比度亮白大字，始终拥有最高布局优先级并自动撑开窗口高度）
         self.curr_subtitle_var = tk.StringVar(
-            value="等待系统音频输入…（已开启语气词/喘息声过滤与防重复保护）"
+            value="等待系统音频输入…"
         )
         self.curr_subtitle_label = tk.Label(
-            body,
+            self.body,
             textvariable=self.curr_subtitle_var,
-            fg="#F8FAFC",
-            bg="#121417",
+            fg="#FFFFFF",
+            bg=bg_color,
             font=("PingFang SC", self.settings.font_size, "bold"),
-            wraplength=860,
+            wraplength=self._window_width - 40,
             justify=tk.CENTER,
         )
-        self.curr_subtitle_label.pack(fill=tk.BOTH, expand=True)
-        self.curr_subtitle_label.bind("<ButtonPress-1>", self._on_drag_start)
-        self.curr_subtitle_label.bind("<B1-Motion>", self._on_drag_motion)
+        self.curr_subtitle_label.pack(side=tk.BOTTOM, fill=tk.X, expand=True, pady=(2, 4))
 
-        self.root.bind("<Configure>", self._on_window_resize)
+        # 绑定任意位置（包括文字本身）左键拖拽移动悬浮窗
+        for widget in (
+            self.top_bar,
+            self.status_label,
+            self.body,
+            self.prev_subtitle_label,
+            self.curr_subtitle_label,
+        ):
+            widget.bind("<ButtonPress-1>", self._on_drag_start)
+            widget.bind("<B1-Motion>", self._on_drag_motion)
+
+        # 鼠标悬停唤醒工具栏，移开后自动隐藏（实现纯文字显示）
+        self.root.bind("<Enter>", self._on_mouse_enter)
+        self.root.bind("<Leave>", self._on_mouse_leave)
+
+    def _toggle_bg_mode(self) -> None:
+        self.settings.transparent_bg = not self.settings.transparent_bg
+        self.settings.save()
+        self.btn_bg_mode.configure(
+            text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板"
+        )
+        self._apply_transparency_mode()
+
+    def _on_mouse_enter(self, _event=None) -> None:
+        if self._hover_hide_job is not None:
+            try:
+                self.root.after_cancel(self._hover_hide_job)
+            except Exception:
+                pass
+            self._hover_hide_job = None
+        if not self._topbar_visible:
+            self._topbar_visible = True
+            self.top_bar.pack(fill=tk.X, side=tk.TOP, before=self.body)
+            self._sync_window_height()
+
+    def _on_mouse_leave(self, _event=None) -> None:
+        if self._is_running and self.settings.transparent_bg:
+            if self._hover_hide_job is not None:
+                try:
+                    self.root.after_cancel(self._hover_hide_job)
+                except Exception:
+                    pass
+            self._hover_hide_job = self.root.after(1800, self._hide_topbar_for_pure_text)
+
+    def _hide_topbar_for_pure_text(self) -> None:
+        self._hover_hide_job = None
+        if self._is_running and self.settings.transparent_bg and self._topbar_visible:
+            self._topbar_visible = False
+            self.top_bar.pack_forget()
+            self._sync_window_height()
+
+    def _sync_window_height(self) -> None:
+        """
+        动态计算新字幕与历史字幕所需像素高度并实时调整窗口高度，
+        确保多行新字幕永远不会被窗口边界或历史字幕压缩、截断。
+        """
+        try:
+            self.root.update_idletasks()
+            req_h = self.curr_subtitle_label.winfo_reqheight() + 24
+            if self.prev_subtitle_var.get():
+                req_h += self.prev_subtitle_label.winfo_reqheight() + 8
+            if self._topbar_visible:
+                req_h += 40
+            needed_h = max(72, min(460, req_h))
+            cur_x = self.root.winfo_x()
+            cur_y = self.root.winfo_y()
+            self.root.geometry(f"{self._window_width}x{needed_h}+{cur_x}+{cur_y}")
+        except Exception:
+            pass
+
+    def _update_subtitle_widgets(self, prev_txt: str, curr_txt: str) -> None:
+        # 1. 控制历史字幕的挂载与卸载（为空或满 5 秒消隐后立即 pack_forget 释放全部空间）
+        old_prev = self.prev_subtitle_var.get()
+        if prev_txt:
+            self.prev_subtitle_var.set(prev_txt)
+            if not old_prev:
+                self.prev_subtitle_label.pack(
+                    side=tk.TOP, fill=tk.X, pady=(0, 2), before=self.curr_subtitle_label
+                )
+        else:
+            if old_prev:
+                self.prev_subtitle_var.set("")
+                self.prev_subtitle_label.pack_forget()
+
+        # 2. 更新当前新字幕并动态扩展窗口高度，防止任何压缩截断
+        if curr_txt != self.curr_subtitle_var.get() or prev_txt != old_prev:
+            self.curr_subtitle_var.set(curr_txt)
+            self._sync_window_height()
 
     def _on_drag_start(self, event) -> None:
         self._drag_offset_x = event.x_root - self.root.winfo_x()
@@ -1521,43 +1611,48 @@ class MacOSSubtitleOverlayApp:
         y = event.y_root - self._drag_offset_y
         self.root.geometry(f"+{x}+{y}")
 
-    def _on_window_resize(self, event) -> None:
-        if event.widget == self.root:
-            wrap_w = max(420, event.width - 56)
-            self.curr_subtitle_label.configure(wraplength=wrap_w)
-            self.prev_subtitle_label.configure(wraplength=wrap_w)
-
     def _toggle_translation(self) -> None:
         if not self._is_running:
             if not self.settings.api_key.strip():
                 self._open_settings_dialog()
                 return
             self._is_running = True
-            self.btn_toggle.configure(text="⏹ 停止翻译", bg="#DC2626", activebackground="#B91C1C")
+            self.btn_toggle.configure(text="⏹ 停止", bg="#DC2626", activebackground="#B91C1C")
             self.curr_subtitle_var.set("正在监听 macOS 系统音频…")
             self.service.start()
+            if self.settings.transparent_bg:
+                self.root.after(2200, self._hide_topbar_for_pure_text)
         else:
             self._is_running = False
-            self.btn_toggle.configure(text="▶ 开始实时翻译", bg="#2563EB", activebackground="#1D4ED8")
+            self.btn_toggle.configure(text="▶ 开始翻译", bg="#2563EB", activebackground="#1D4ED8")
             self.service.stop()
+            self._on_mouse_enter()
 
     def _poll_ui_events(self) -> None:
         try:
+            # 1. 每帧检查历史字幕是否满 5 秒需要自动消失
+            if self.display_ctrl.check_expiration():
+                self._update_subtitle_widgets(
+                    self.display_ctrl.prev_subtitle,
+                    self.display_ctrl.curr_subtitle or self.curr_subtitle_var.get(),
+                )
+
+            # 2. 处理异步事件队列
             while True:
                 evt_type, payload = self.ui_queue.get_nowait()
                 if evt_type == "subtitle":
                     zh_text, src_text, is_final = payload
-                    display_text = zh_text
-                    if self.settings.show_bilingual and src_text:
-                        display_text = f"{zh_text}\n[{src_text}]"
+                    prev_txt, curr_txt = self.display_ctrl.on_new_subtitle(
+                        zh_text=zh_text,
+                        src_text=src_text,
+                        show_bilingual=self.settings.show_bilingual,
+                        is_final=is_final,
+                    )
+                    self._update_subtitle_widgets(prev_txt, curr_txt)
 
                     if is_final:
-                        self.prev_subtitle_var.set(zh_text)
-                        self.curr_subtitle_var.set(display_text)
                         ts_str = time.strftime("%H:%M:%S")
                         self._history_lines.append(f"[{ts_str}] {zh_text}")
-                    else:
-                        self.curr_subtitle_var.set(display_text)
 
                 elif evt_type == "status":
                     msg, color = payload
@@ -1566,32 +1661,33 @@ class MacOSSubtitleOverlayApp:
 
                 elif evt_type == "level":
                     rms, reason = payload
-                    db_bar = min(10, int(rms * 180))
-                    meter = "▮" * db_bar + "▯" * (10 - db_bar)
+                    db_bar = min(8, int(rms * 160))
+                    meter = "▮" * db_bar + "▯" * (8 - db_bar)
                     reason_map = {
                         "speech_active": ("人声翻译中", "#4ADE80"),
-                        "speech_onset": ("唤醒捕捉 (含300ms预卷)", "#38BDF8"),
+                        "speech_onset": ("唤醒捕捉", "#38BDF8"),
                         "hangover": ("句尾延续", "#A3E635"),
-                        "breath_filtered": ("已过滤喘息/呼吸声", "#FBBF24"),
-                        "groan_filtered": ("已过滤低频呻吟/闷哼", "#FBBF24"),
-                        "silence": ("静音热备 (零帧保活)", "#94A3B8"),
+                        "breath_filtered": ("已滤喘息", "#FBBF24"),
+                        "groan_filtered": ("已滤呻吟", "#FBBF24"),
+                        "silence": ("静音热备", "#94A3B8"),
                     }
                     label_txt, color = reason_map.get(reason, ("监听中", "#94A3B8"))
                     self.vad_badge.configure(text=f"{meter} {label_txt}", fg=color)
         except queue.Empty:
             pass
         finally:
-            self.root.after(40, self._poll_ui_events)
+            self.root.after(50, self._poll_ui_events)
 
     def _open_settings_dialog(self) -> None:
+        self._on_mouse_enter()
         win = tk.Toplevel(self.root)
-        win.title("自定义 API Key 与音频过滤设置")
-        win.geometry("560x520")
+        win.title("自定义 API Key 与透明字幕设置")
+        win.geometry("560x560")
         win.configure(bg="#1E222B")
         win.attributes("-topmost", True)
         win.transient(self.root)
 
-        pad = {"padx": 16, "pady": 6}
+        pad = {"padx": 16, "pady": 5}
 
         tk.Label(
             win,
@@ -1599,7 +1695,7 @@ class MacOSSubtitleOverlayApp:
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
-        ).pack(anchor=tk.W, padx=16, pady=(14, 2))
+        ).pack(anchor=tk.W, padx=16, pady=(12, 2))
 
         api_key_var = tk.StringVar(value=self.settings.api_key)
         api_entry = tk.Entry(
@@ -1637,7 +1733,7 @@ class MacOSSubtitleOverlayApp:
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
-        ).pack(anchor=tk.W, padx=16, pady=(10, 2))
+        ).pack(anchor=tk.W, padx=16, pady=(8, 2))
 
         model_var = tk.StringVar(value=self.settings.model_name)
         model_combo = ttk.Combobox(
@@ -1656,7 +1752,7 @@ class MacOSSubtitleOverlayApp:
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
-        ).pack(anchor=tk.W, padx=16, pady=(10, 2))
+        ).pack(anchor=tk.W, padx=16, pady=(8, 2))
 
         backend_var = tk.StringVar(value=self.settings.capture_backend)
         backend_combo = ttk.Combobox(
@@ -1672,11 +1768,11 @@ class MacOSSubtitleOverlayApp:
 
         tk.Label(
             win,
-            text="语气词与喘息/呻吟声过滤强度 (0.0 ~ 1.0，推荐 0.65):",
+            text="语气词与喘息/呻吟声过滤强度 (0.1 ~ 0.95，推荐 0.65):",
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
-        ).pack(anchor=tk.W, padx=16, pady=(10, 2))
+        ).pack(anchor=tk.W, padx=16, pady=(8, 2))
 
         breath_var = tk.DoubleVar(value=self.settings.breath_filter_strength)
         tk.Scale(
@@ -1693,24 +1789,35 @@ class MacOSSubtitleOverlayApp:
 
         tk.Label(
             win,
-            text="防重复字幕相似度阈值 (越低去重越严格，推荐 0.82):",
+            text="字幕字号大小 (推荐 26):",
             fg="#E2E8F0",
             bg="#1E222B",
             font=("PingFang SC", 11, "bold"),
         ).pack(anchor=tk.W, padx=16, pady=(8, 2))
 
-        dedup_var = tk.DoubleVar(value=self.settings.dedup_similarity)
+        font_var = tk.IntVar(value=self.settings.font_size)
         tk.Scale(
             win,
-            variable=dedup_var,
-            from_=0.60,
-            to=0.95,
-            resolution=0.02,
+            variable=font_var,
+            from_=18,
+            to=42,
+            resolution=2,
             orient=tk.HORIZONTAL,
             bg="#1E222B",
             fg="#F8FAFC",
             highlightthickness=0,
         ).pack(fill=tk.X, padx=16)
+
+        transparent_var = tk.BooleanVar(value=self.settings.transparent_bg)
+        tk.Checkbutton(
+            win,
+            text="背景完全透明（只显示文字，鼠标移走自动隐藏工具栏）",
+            variable=transparent_var,
+            bg="#1E222B",
+            fg="#4ADE80",
+            selectcolor="#0F172A",
+            activebackground="#1E222B",
+        ).pack(anchor=tk.W, padx=16, pady=4)
 
         bilingual_var = tk.BooleanVar(value=self.settings.show_bilingual)
         tk.Checkbutton(
@@ -1721,16 +1828,24 @@ class MacOSSubtitleOverlayApp:
             fg="#CBD5E1",
             selectcolor="#0F172A",
             activebackground="#1E222B",
-        ).pack(anchor=tk.W, padx=16, pady=6)
+        ).pack(anchor=tk.W, padx=16, pady=2)
 
         def _save_and_apply() -> None:
             self.settings.api_key = api_key_var.get().strip()
             self.settings.model_name = model_var.get().strip() or DEFAULT_MODEL
             self.settings.capture_backend = backend_var.get().strip() or "auto"
             self.settings.breath_filter_strength = float(breath_var.get())
-            self.settings.dedup_similarity = float(dedup_var.get())
+            self.settings.font_size = int(font_var.get())
+            self.settings.transparent_bg = bool(transparent_var.get())
             self.settings.show_bilingual = bool(bilingual_var.get())
             self.settings.save()
+
+            self.curr_subtitle_label.configure(font=("PingFang SC", self.settings.font_size, "bold"))
+            self.prev_subtitle_label.configure(font=("PingFang SC", max(15, self.settings.font_size - 8), "bold"))
+            self.btn_bg_mode.configure(
+                text="🔲 纯透明文字" if self.settings.transparent_bg else "⬛ 半透底板"
+            )
+            self._apply_transparency_mode()
             self.service.reload_runtime_params()
             win.destroy()
             self.status_label.configure(text="设置已保存并立即生效")
@@ -1746,7 +1861,7 @@ class MacOSSubtitleOverlayApp:
             padx=18,
             pady=6,
             cursor="hand2",
-        ).pack(pady=14)
+        ).pack(pady=12)
 
     def _open_history_dialog(self) -> None:
         win = tk.Toplevel(self.root)
@@ -1802,24 +1917,42 @@ def run_self_test() -> int:
     dup_final = dedup.finalize_turn()
     assert dup_final is None, "重复字幕应当在归档阶段被拦截"
 
-    # 3. 验证声学频谱过滤器（静音 vs 宽频喘息白噪 vs 模拟人声谐波）
+    # 3. 验证历史字幕 5 秒自动消失与新字幕完整保留逻辑
+    disp = SubtitleDisplayStateController(expire_seconds=5.0)
+    prev_t, curr_t = disp.on_new_subtitle("第一句已经完成的字幕", is_final=True, now=100.0)
+    assert prev_t == "" and curr_t == "第一句已经完成的字幕"
+
+    # 101秒时新字幕流入，第一句进入历史字幕
+    prev_t, curr_t = disp.on_new_subtitle("第二句正在实时生成的新字幕不会被任何历史字幕压缩截断", is_final=False, now=101.0)
+    assert prev_t == "第一句已经完成的字幕" and "第二句正在实时生成的新字幕" in curr_t
+
+    # 104秒时（未满5秒），历史字幕仍在
+    assert not disp.check_expiration(now=104.0)
+    assert disp.prev_subtitle == "第一句已经完成的字幕"
+
+    # 106.1秒时（满5秒），历史字幕自动消失，且新字幕完好无损
+    assert disp.check_expiration(now=106.1)
+    assert disp.prev_subtitle == "", "历史字幕应当在5秒后自动消失"
+    assert disp.curr_subtitle == "第二句正在实时生成的新字幕不会被任何历史字幕压缩截断", "新字幕绝不能被截断或丢失"
+
+    # 4. 验证声学频谱过滤器
     acoustic = AcousticSpeechFilter(sample_rate=TARGET_SAMPLE_RATE, rms_threshold=0.008, breath_filter_strength=0.65)
 
     silent_pcm = bytes(CHUNK_BYTES)
     send_flag, _, meta = acoustic.analyze_chunk(silent_pcm)
-    assert not send_flag and meta["reason"] == "silence", f"静音块判定异常: {meta}"
+    assert not send_flag and meta["reason"] == "silence"
 
     rng = np.random.default_rng(42)
     breath_noise = (rng.uniform(-0.15, 0.15, size=CHUNK_SAMPLES) * np.tile([1.0, -1.0], CHUNK_SAMPLES // 2)).astype(np.float32)
     breath_pcm = (breath_noise * 32767.0).astype("<i2").tobytes()
     send_flag, _, meta = acoustic.analyze_chunk(breath_pcm)
-    assert not send_flag and meta["reason"] == "breath_filtered", f"喘息噪声应当被拦截: {meta}"
+    assert not send_flag and meta["reason"] == "breath_filtered"
 
     t = np.linspace(0, CHUNK_DURATION_MS / 1000.0, CHUNK_SAMPLES, endpoint=False)
     voice_wave = 0.25 * np.sin(2 * np.pi * 180 * t) + 0.35 * np.sin(2 * np.pi * 720 * t) + 0.20 * np.sin(2 * np.pi * 1600 * t)
     voice_pcm = (np.clip(voice_wave, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
     send_flag, chunks, meta = acoustic.analyze_chunk(voice_pcm)
-    assert send_flag and meta["reason"] == "speech_onset" and len(chunks) >= 2, f"人声唤醒与300ms预卷异常: {meta}"
+    assert send_flag and meta["reason"] == "speech_onset" and len(chunks) >= 2
 
     print("=== All Self-Tests Passed Successfully! ===")
     return 0
