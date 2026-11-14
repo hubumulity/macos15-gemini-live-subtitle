@@ -4,12 +4,10 @@ on:
   push:
     branches: [ "main", "master" ]
     tags: [ "v*" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
       create_release:
-        description: "是否同时创建 GitHub Release 发布安装包"
+        description: "是否同时创建 GitHub Release 发布 macOS 安装包"
         required: false
         default: "true"
         type: boolean
@@ -19,18 +17,8 @@ permissions:
 
 jobs:
   build-macos15-installer:
-    name: Build on macOS 15 (${{ matrix.arch_label }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch_label: arm64-Apple-Silicon
-            swift_target: arm64-apple-macos13.0
-          - runner: macos-15-intel
-            arch_label: x86_64-Intel
-            swift_target: x86_64-apple-macos13.0
+    name: Build macOS 15 Native App & DMG
+    runs-on: macos-15
 
     steps:
       - name: Checkout Repository
@@ -41,7 +29,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PortAudio & Python Packaging Dependencies
+      - name: Install macOS Packaging Dependencies
         run: |
           brew install portaudio python-tk@3.12 || true
           python3 -m pip install --upgrade pip
@@ -57,7 +45,6 @@ jobs:
           out.write_text(app.SWIFT_SCK_SOURCE, encoding="utf-8")
           EOF
           swiftc -O build_bin/sck_audio_helper.swift \
-            -target ${{ matrix.swift_target }} \
             -o build_bin/sck_audio_helper \
             -framework ScreenCaptureKit \
             -framework CoreMedia \
@@ -70,7 +57,7 @@ jobs:
         run: |
           python3 macos15_gemini_live_subtitle.py --self-test
 
-      - name: Generate PyInstaller Spec with macOS 15 TCC Privacy Permissions
+      - name: Generate Single-Executable PyInstaller Spec (Zero .py Files in Bundle)
         run: |
           cat << 'EOF' > GeminiLiveSubtitle.spec
           # -*- mode: python ; coding: utf-8 -*-
@@ -85,45 +72,38 @@ jobs:
               hookspath=[],
               hooksconfig={},
               runtime_hooks=[],
-              excludes=[],
+              excludes=['pytest', 'unittest', 'pydoc', 'doctest', 'pip', 'setuptools'],
               noarchive=False,
           )
           pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+          # 采用单文件内嵌字节码归档模式 (exclude_binaries=False)，所有业务代码与库均封入二进制可执行文件内
           exe = EXE(
               pyz,
               a.scripts,
+              a.binaries,
+              a.zipfiles,
+              a.datas,
               [],
-              exclude_binaries=True,
               name='GeminiLiveSubtitle',
               debug=False,
               bootloader_ignore_signals=False,
-              strip=False,
+              strip=True,
               upx=False,
               console=False,
               disable_windowed_traceback=False,
               argv_emulation=False,
           )
-          coll = COLLECT(
-              exe,
-              a.binaries,
-              a.zipfiles,
-              a.datas,
-              strip=False,
-              upx=False,
-              upx_exclude=[],
-              name='GeminiLiveSubtitle',
-          )
           app = BUNDLE(
-              coll,
+              exe,
               name='GeminiLiveSubtitle.app',
               icon=None,
               bundle_identifier='com.gemini.macos15.livesubtitle',
               info_plist={
                   'CFBundleName': 'Gemini 3.5 Live 实时字幕',
                   'CFBundleDisplayName': 'Gemini 3.5 Live 实时字幕',
-                  'CFBundleShortVersionString': '1.0.0',
-                  'CFBundleVersion': '1.0.0',
+                  'CFBundleShortVersionString': '1.1.0',
+                  'CFBundleVersion': '1.1.0',
                   'LSMinimumSystemVersion': '13.0',
                   'NSHighResolutionCapable': True,
                   'NSScreenCaptureUsageDescription': '需要录屏与系统录音权限以通过 macOS 15 ScreenCaptureKit 直接捕获系统桌面音频并生成实时中文字幕。',
@@ -133,18 +113,19 @@ jobs:
           )
           EOF
 
-      - name: Build macOS .app Bundle via PyInstaller & Ad-Hoc CodeSign
+      - name: Build Pure Binary macOS .app Bundle & Strip Any Residual .py Files
         run: |
           pyinstaller --noconfirm --clean GeminiLiveSubtitle.spec
+          # 彻底清理第三方依赖包可能附带的任何 .py 源文件，确保 .app 内部 100% 为编译后二进制
+          find "dist/GeminiLiveSubtitle.app" -type f -name "*.py" -delete
           codesign --force --deep --sign - "dist/GeminiLiveSubtitle.app"
 
-      - name: Package .app into Distributable macOS .dmg Disk Image
+      - name: Package Pure .app into macOS .dmg Disk Image (No Scripts Included)
         run: |
           mkdir -p dmg_staging
           cp -R "dist/GeminiLiveSubtitle.app" dmg_staging/
           ln -s /Applications dmg_staging/Applications
-          cp setup_and_run_macos15.sh dmg_staging/
-          DMG_NAME="GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}.dmg"
+          DMG_NAME="GeminiLiveSubtitle-macOS15.dmg"
           hdiutil create \
             -volname "Gemini 3.5 Live 实时字幕" \
             -srcfolder dmg_staging \
@@ -152,31 +133,30 @@ jobs:
             "${DMG_NAME}"
           shasum -a 256 "${DMG_NAME}" > "${DMG_NAME}.sha256"
 
-      - name: Upload Compiled .dmg Installer to GitHub Actions Artifacts
+      - name: Upload Compiled macOS .dmg Installer to Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}
+          name: GeminiLiveSubtitle-macOS15-Installer
           path: |
-            GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}.dmg
-            GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}.dmg.sha256
+            GeminiLiveSubtitle-macOS15.dmg
+            GeminiLiveSubtitle-macOS15.dmg.sha256
           retention-days: 30
 
-      - name: Publish .dmg Installer to GitHub Releases
+      - name: Publish macOS .dmg Installer to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.0.0-latest' }}
-          name: "Gemini 3.5 Live Translate macOS 15 实时字幕安装包"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.1.0' }}
+          name: "Gemini 3.5 Live Translate macOS 15 纯净版实时字幕安装包"
           body: |
             ### Gemini 3.5 Live Translate · macOS 15 (Sequoia) 实时系统音频中文字幕安装包
-            - **Apple Silicon (M1/M2/M3/M4)**: 下载 `GeminiLiveSubtitle-macOS15-arm64-Apple-Silicon.dmg`
-            - **Intel Mac**: 下载 `GeminiLiveSubtitle-macOS15-x86_64-Intel.dmg`
-            - **安装说明**:
-              1. 双击打开 `.dmg` 镜像，将 `GeminiLiveSubtitle.app` 拖入 `Applications` 文件夹。
-              2. 若首次打开提示未签名开发者，请在终端执行：`xattr -cr /Applications/GeminiLiveSubtitle.app`
-              3. 在「系统设置 -> 隐私与安全性 -> 录屏与系统录音」中勾选允许，点击右上角「设置」填入 Google AI Studio API Key 即可开始不间断翻译。
+            - **仅包含纯编译版 `GeminiLiveSubtitle.app`**（单可执行文件封包，已剔除所有 `.py` 源文件与外部脚本）
+            - **新增透明悬浮字幕特性**:
+              1. 默认开启**纯透明背景模式（只显示文字）**，翻译启动后鼠标移开自动隐去工具栏。
+              2. **历史字幕 5 秒后自动消失**并彻底释放布局空间。
+              3. **新字幕动态自适应高度**，无论长句多少行均自动撑开显示，绝不压缩或截断。
           files: |
-            GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}.dmg
-            GeminiLiveSubtitle-macOS15-${{ matrix.arch_label }}.dmg.sha256
+            GeminiLiveSubtitle-macOS15.dmg
+            GeminiLiveSubtitle-macOS15.dmg.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
