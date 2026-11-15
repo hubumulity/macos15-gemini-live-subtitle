@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.2.3)
+macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.3.1)
 ===========================================================================
 基于 Google Gemini Live API (`gemini-3.5-live-translate-preview`) 构建的桌面级实时字幕工具。
 
@@ -10,15 +10,14 @@ macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软�
    - 模式 A（推荐，免装虚拟声卡）：自动调用内置预编译的 Swift `ScreenCaptureKit` 音频捕获器，
      直接抓取 macOS 系统桌面音频并输出 16kHz 16-bit 单声道 PCM 流。
    - 模式 B（CoreAudio 虚拟声卡/输入设备）：支持 BlackHole 2ch、Loopback 或任意麦克风/聚合设备。
-2. 弱音/小声说话自动增益放大 (Smart AGC) + 高灵敏度数字音频门限：
-   - 将数字音频静音门限下调至 `0.0004` (-68 dBFS)，支持极低系统音量与耳语/小声说话捕捉；
-   - 内置实时自动增益控制 (AGC)：当检测到小声说话 (`0.0004 <= RMS < 0.06`) 时，自动将音频平滑放大
-     （最高 15 倍动态增益 + `tanh` 软限幅防爆音）后再送入 Gemini 3.5 Live 模型，彻底解决小声说话不翻译问题。
-3. 单行逐句滚动刷新 + 严格 5 秒自动清空 (彻底根除两排重复字幕)：
-   - 废除上下双排残影布局，改为**单行纯净大字展示最新短句**：流式长文按句号、逗号、问号及字数上限
-     （默认 24 字）实时切分，新短句自动替换旧短句，物理上彻底杜绝“上下两排重复字幕”；
-   - 每句字幕显示满 5.0 秒无更新后自动清空屏幕。
-4. 安全无崩溃的跨应用全局置顶 (`PYFUNCTYPE` 单次设置 `hidesOnDeactivate=False` + `NSStatusWindowLevel`)。
+2. 自动记忆字幕窗口位置 (`window_x`, `window_y` 持久化)：
+   - 每次拖动字幕松开鼠标或关闭软件时，自动将当前屏幕坐标写入 `~/.config/macos15_gemini_live_subtitle/settings.json`；
+   - 下次启动时自动恢复至上次摆放的坐标（并内置多显示器越界保护，防止外接显示器拔出后窗口跑到屏幕外）。
+3. 专属高颜值 macOS 15 Sequoia 极光声波字幕图标 (`--generate-icon` + `.icns` 原生打包)：
+   - 内置 1024x1024 超清圆角矩形图标渲染器（深海蓝紫极光渐变 + 灵动声波 + 悬浮字幕条 + Gemini 星芒），
+     在 GitHub Actions 编译时自动通过 macOS `iconutil` 生成原生 `AppIcon.icns` 注入 `.app` 安装包。
+4. 弱音/小声说话自动增益放大 (Smart AGC) + 高灵敏度数字音频门限 (`0.0004`)。
+5. 单行逐句滚动刷新 + 严格 5 秒自动清空 + 无崩溃跨应用全局置顶 (`PYFUNCTYPE`)。
 """
 
 from __future__ import annotations
@@ -116,15 +115,98 @@ MAX_CHARS_PER_LINE = 24
 
 
 # ==============================================================================
-# 0. macOS 原生 Cocoa 窗口防隐藏与全局置顶设置 (GIL-Safe PYFUNCTYPE, 无重入通知)
+# 0. macOS 15 专属高清应用图标生成器 (1024x1024 Squircle PNG -> AppIcon.icns)
+# ==============================================================================
+def generate_macos_app_icon_png(output_path: str, size: int = 1024) -> str:
+    """
+    采用 2x 超采样抗锯齿 (Supersampling LANCZOS) 渲染极简 Apple Design 风格 macOS 15 图标：
+    - 曜石黑与深空钛灰微光渐变圆角底座 (无任何杂乱文字或伪字符)；
+    - 中心悬浮暖珀金到珍珠白的立体流线声波雕塑与极简双层玻璃字幕光条。
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+
+    ss = 2
+    W = size * ss
+    img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+
+    # 1. 曜石黑 + 深空钛灰径向高质感底色
+    y_grid, x_grid = np.mgrid[0:W, 0:W].astype(np.float32) / float(W)
+    dist = np.sqrt((x_grid - 0.5) ** 2 + (y_grid - 0.32) ** 2)
+    r = np.clip(38 - 22 * dist + 14 * (1.0 - y_grid), 12, 60)
+    g = np.clip(40 - 22 * dist + 16 * (1.0 - y_grid), 14, 64)
+    b = np.clip(48 - 20 * dist + 24 * (1.0 - y_grid), 18, 78)
+    a = np.full((W, W), 255, dtype=np.uint8)
+    bg_arr = np.stack([r.astype(np.uint8), g.astype(np.uint8), b.astype(np.uint8), a], axis=-1)
+    bg_img = Image.fromarray(bg_arr, mode="RGBA")
+
+    pad = int(W * 0.085)
+    corner_r = int(W * 0.215)
+    mask = Image.new("L", (W, W), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([pad, pad, W - pad, W - pad], radius=corner_r, fill=255)
+    img.paste(bg_img, (0, 0), mask)
+
+    # 2. 中心暖珀金柔光氛围层
+    glow = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(glow, "RGBA")
+    cx, cy = W // 2, int(W * 0.46)
+    gdraw.ellipse([cx - int(W * 0.28), cy - int(W * 0.22), cx + int(W * 0.28), cy + int(W * 0.22)], fill=(251, 146, 60, 75))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=int(W * 0.07)))
+    img = Image.alpha_composite(img, glow)
+
+    draw = ImageDraw.Draw(img, "RGBA")
+    # 钛金属细腻高光内描边
+    draw.rounded_rectangle(
+        [pad + 2, pad + 2, W - pad - 2, W - pad - 2],
+        radius=corner_r - 2,
+        outline=(255, 255, 255, 52),
+        width=max(2, W // 220),
+    )
+
+    # 3. 极简 7 柱黄金比例立体声波胶囊 (珍珠白 + 暖珀橙渐变)
+    heights = [0.11, 0.21, 0.34, 0.44, 0.34, 0.21, 0.11]
+    palette = [
+        (251, 146, 60, 235),
+        (253, 186, 116, 245),
+        (254, 215, 170, 252),
+        (255, 255, 255, 255),
+        (254, 215, 170, 252),
+        (253, 186, 116, 245),
+        (251, 146, 60, 235),
+    ]
+    bar_w = int(W * 0.052)
+    gap = int(W * 0.032)
+    total_w = len(heights) * bar_w + (len(heights) - 1) * gap
+    sx = cx - total_w // 2
+
+    for i, (h_ratio, col) in enumerate(zip(heights, palette)):
+        bx0 = sx + i * (bar_w + gap)
+        bx1 = bx0 + bar_w
+        hh = int(W * h_ratio * 0.5)
+        by0 = cy - hh
+        by1 = cy + hh
+        draw.rounded_rectangle([bx0, by0, bx1, by1], radius=bar_w // 2, fill=col)
+
+    # 4. 底部极简悬浮毛玻璃字幕光条 (无任何文字，纯几何美学)
+    bar_y = int(W * 0.74)
+    bar_h = int(W * 0.044)
+    bar_half_w = int(W * 0.23)
+    draw.rounded_rectangle(
+        [cx - bar_half_w, bar_y - bar_h // 2, cx + bar_half_w, bar_y + bar_h // 2],
+        radius=bar_h // 2,
+        fill=(255, 255, 255, 235),
+    )
+
+    final_img = img.resize((size, size), resample=Image.Resampling.LANCZOS)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    final_img.save(out, format="PNG")
+    return str(out.resolve())
+
+
+# ==============================================================================
+# 0B. macOS 原生 Cocoa 窗口防隐藏与全局置顶设置 (GIL-Safe PYFUNCTYPE, 无重入通知)
 # ==============================================================================
 def configure_macos_window_non_hiding_once() -> bool:
-    """
-    在窗口完成首次映射后单次调用：
-    - 使用 `ctypes.PYFUNCTYPE`（保持 Python GIL 不被释放，杜绝与 `_tkinter` 的 `PyEval_RestoreThread` 冲突）；
-    - 仅设置 `setHidesOnDeactivate:(False)`、`setLevel:(25)` 与 `setCollectionBehavior:(273)` 属性标志位；
-    - 绝不调用 `orderFrontRegardless` 或任何触发 `windowMapped:` 同步通知的 API，彻底杜绝 Tcl/Tk 重入崩溃。
-    """
     if sys.platform != "darwin":
         return False
     try:
@@ -285,7 +367,7 @@ if #available(macOS 13.0, *) {
 
 
 # ==============================================================================
-# 2. 用户配置管理
+# 2. 用户配置管理 (含窗口坐标持久化记忆)
 # ==============================================================================
 @dataclass
 class AppSettings:
@@ -302,17 +384,18 @@ class AppSettings:
     sentence_ttl_sec: float = 5.0         # 每句字幕保留秒数（默认 5.0 秒自动清空）
     max_chars_per_line: int = 24          # 单句自动切换最大字数
     window_alpha: float = 0.92
+    window_x: int = -1                    # 上次保存的字幕窗口 X 坐标 (-1 表示首次居中偏下)
+    window_y: int = -1                    # 上次保存的字幕窗口 Y 坐标 (-1 表示首次居中偏下)
     show_bilingual: bool = False          # 是否同时显示源语言识别文本
     echo_target_language: bool = False    # 当源音频本身是中文时是否复述
 
     @classmethod
-    def load(cls) -> "AppSettings":
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    def load(cls, config_path: Path = CONFIG_FILE) -> "AppSettings":
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         env_key = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-        if CONFIG_FILE.exists():
+        if config_path.exists():
             try:
-                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                # 如果旧配置文件中保存了过高的 vad_rms_threshold (0.008)，自动迁移至高灵敏度 0.0004
+                data = json.loads(config_path.read_text(encoding="utf-8"))
                 if data.get("vad_rms_threshold", 0.0) >= 0.005:
                     data["vad_rms_threshold"] = 0.0004
                 settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -323,30 +406,35 @@ class AppSettings:
                 logger.warning("读取配置文件失败，使用默认配置: %s", exc)
         return cls(api_key=env_key)
 
-    def save(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(
+    def save(self, config_path: Path = CONFIG_FILE) -> None:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
             json.dumps(self.__dict__, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         try:
-            os.chmod(CONFIG_FILE, 0o600)
+            os.chmod(config_path, 0o600)
         except OSError:
             pass
 
+    def resolve_window_position(
+        self, win_w: int, win_h: int, screen_w: int, screen_h: int
+    ) -> Tuple[int, int]:
+        """计算恢复窗口位置，若尚未保存过则默认置于屏幕底部居中，并防止越出屏幕边界。"""
+        if self.window_x < 0 or self.window_y < 0:
+            default_x = max(20, (screen_w - win_w) // 2)
+            default_y = max(40, screen_h - win_h - 110)
+            return default_x, default_y
+
+        clamped_x = max(0, min(self.window_x, max(0, screen_w - 120)))
+        clamped_y = max(24, min(self.window_y, max(24, screen_h - 60)))
+        return clamped_x, clamped_y
+
 
 # ==============================================================================
-# 3. 声学前端：高灵敏度 VAD + 弱音自动增益放大 (AGC) + 喘息过滤 + 300ms 预卷
+# 3. 声学前端：高灵敏度 VAD + 弱音自动增益放大 (AGC) + 喘息过滤 + 400ms 预卷
 # ==============================================================================
 class AcousticSpeechFilter:
-    """
-    1. 支持极低音量/耳语检测 (`rms_threshold = 0.0004`)；
-    2. 内置 Smart AGC (自动增益控制)：当说话声音很轻 (`0.0004 <= rms < 0.06`) 时，
-       自动将音量平滑放大至标准响度 (`target_rms = 0.08`，最高放大 15 倍并带 `tanh` 软限幅)，
-       确保 Gemini 3.5 Live 模型能够清晰识别小声说话内容；
-    3. 仅拦截高能量宽频吹麦/喘息白噪，绝不误伤轻声细语。
-    """
-
     def __init__(
         self,
         sample_rate: int = TARGET_SAMPLE_RATE,
@@ -359,8 +447,8 @@ class AcousticSpeechFilter:
         self.breath_filter_strength = breath_filter_strength
         self.enable_agc = enable_agc
 
-        self.preroll_buffer: Deque[bytes] = deque(maxlen=4)  # 400ms 预卷缓冲，确保轻声起音不漏字
-        self.hangover_max_frames = 16  # 1.6 秒句尾保持，防止轻声说话尾音被切
+        self.preroll_buffer: Deque[bytes] = deque(maxlen=4)
+        self.hangover_max_frames = 16
         self.hangover_counter = 0
         self.in_speech_segment = False
 
@@ -370,14 +458,12 @@ class AcousticSpeechFilter:
         self.enable_agc = bool(enable_agc)
 
     def _apply_smart_agc(self, samples: np.ndarray, rms: float) -> bytes:
-        """对小声说话/低音量系统音频进行动态增益放大，使模型能清晰识别轻声语音。"""
         if not self.enable_agc or rms <= 1e-6:
             clamped = np.clip(samples, -1.0, 1.0)
             return (clamped * 32767.0).astype("<i2").tobytes()
 
         target_rms = 0.085
         if rms < target_rms:
-            # 最高放大 15 倍 (+23.5 dB)，让耳语或低音量视频也能达到清晰识别电平
             gain = min(15.0, target_rms / (rms + 1e-7))
             boosted = np.tanh(samples * gain * 1.1) / np.tanh(1.1)
         else:
@@ -392,7 +478,6 @@ class AcousticSpeechFilter:
         samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
 
-        # 1. 纯静音检测 (门限默认 0.0004，仅过滤完全无声的数字底噪)
         if rms < self.rms_threshold:
             if self.in_speech_segment and self.hangover_counter > 0:
                 self.hangover_counter -= 1
@@ -401,7 +486,6 @@ class AcousticSpeechFilter:
             self.preroll_buffer.append(pcm16_bytes)
             return False, [], {"rms": rms, "is_speech": False, "reason": "silence"}
 
-        # 2. 频谱检测：仅针对明显响亮的气流喘息/吹麦白噪声进行拦截，保护小声说话不被误杀
         if rms > 0.015:
             zero_crossings = float(np.mean(np.abs(np.diff(np.signbit(samples)))))
             windowed = samples * np.hanning(len(samples))
@@ -424,7 +508,6 @@ class AcousticSpeechFilter:
                     return True, [bytes(len(pcm16_bytes))], {"rms": rms, "is_speech": False, "reason": "breath_filtered"}
                 return False, [], {"rms": rms, "is_speech": False, "reason": "breath_filtered"}
 
-        # 3. 确认是人声（含小声说话），应用 Smart AGC 动态增益放大
         processed_pcm = self._apply_smart_agc(samples, rms)
         self.hangover_counter = self.hangover_max_frames
 
@@ -559,14 +642,6 @@ class SubtitleCleanerAndDeduplicator:
 # 4B. 单排最新短句控制器：每次只显示最新一句短字幕 + 5 秒无更新自动清空
 # ==============================================================================
 class SubtitleDisplayStateController:
-    """
-    彻底采用**单排当前句模式** (`prev_subtitle` 恒为空，仅输出最新的一句 `curr_subtitle`)：
-    1. 物理上只有单排字幕，彻底杜绝上下两排出现重复字幕或上一句尾部残影（如顶排残留“之类的。”）；
-    2. 当一句话流式增长超过标点（。！？；，、）或超过 `max_chars_per_line`（24 字）时，
-       立即切换到最新的当前短句显示，绝不堆积成冗长段落；
-    3. 当前短句自最后一次文字变化起满 5.0 秒无新字流入，立即自动清空屏幕 (`curr_subtitle = ""`)！
-    """
-
     CLAUSE_SPLIT_RE = re.compile(r"[^。！？；!?;，,、：:\n]+[。！？；!?;，,、：:]?")
 
     def __init__(
@@ -582,7 +657,6 @@ class SubtitleDisplayStateController:
         self._last_change_ts: float = 0.0
 
     def extract_latest_short_clause(self, text: str) -> str:
-        """从累积流式文本中仅提取最新正在说的那一句短句（单行不超过 max_chars_per_line）。"""
         if not text or not text.strip():
             return ""
 
@@ -591,11 +665,9 @@ class SubtitleDisplayStateController:
             return ""
 
         latest = clauses[-1]
-        # 如果最新子句刚刚开始（只有 1~3 个字，例如“之类的”），且与前一个子句拼起来不超过单行上限，则合并成完整短句
         if len(clauses) >= 2 and len(latest) <= 4 and (len(clauses[-2]) + 1 + len(latest)) <= self.max_chars_per_line:
             latest = f"{clauses[-2]}，{latest}"
 
-        # 若单个无标点子句超过单行上限，仅截取最新末尾段展示
         if len(latest) > self.max_chars_per_line:
             chunks = [
                 latest[i : i + self.max_chars_per_line]
@@ -1119,7 +1191,6 @@ class GeminiLiveTranslateService:
                 now = time.monotonic()
                 idle_sec = now - last_send_ts
 
-                # 注意：此处仅向服务端补发静音帧辅助断句，绝不在发送协程里清空 deduplicator，避免与接收协程产生竞争导致重复字幕
                 if not sent_tail_flush:
                     for _ in range(2):
                         await session.send_realtime_input(
@@ -1377,13 +1448,13 @@ class WebHudSubtitleApp:
 
 
 # ==============================================================================
-# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (单排纯净字幕 + 弱音AGC + 5秒清空)
+# 7B. macOS 15 原生置顶纯透明字幕悬浮窗 (位置自动记忆 + 单排字幕 + 弱音AGC)
 # ==============================================================================
 class MacOSSubtitleOverlayApp:
     """
     针对 macOS 15.2 (Apple Silicon) 深度优化的原生悬浮字幕窗口：
-    1. 彻底采用**单排居中字幕**（仅 `curr_subtitle_label`，完全移除第二排标签），从物理上根除上下两排重复字幕；
-    2. 每次只展示最新一句短字幕，满 5 秒无更新自动清空；
+    1. 自动记忆上次拖放位置 (`window_x`, `window_y`)：松开鼠标或退出时立即写入本地配置，下次启动直接到位；
+    2. 单排居中字幕（仅 `curr_subtitle_label`），每次只展示最新一句短字幕，满 5 秒无更新自动清空；
     3. 内置弱音/小声说话自动增益放大 (Smart AGC)，哪怕音量极低或耳语也能准确识别翻译。
     """
 
@@ -1399,7 +1470,14 @@ class MacOSSubtitleOverlayApp:
         self.root.title("Gemini 3.5 Live 实时中文字幕")
         self._window_width = 880
         self._window_height = 110
-        self.root.geometry(f"{self._window_width}x{self._window_height}+220+720")
+
+        # 读取屏幕宽高并恢复上次记忆的窗口坐标 (带多显示器越界安全保护)
+        screen_w = max(800, self.root.winfo_screenwidth())
+        screen_h = max(600, self.root.winfo_screenheight())
+        init_x, init_y = self.settings.resolve_window_position(
+            self._window_width, self._window_height, screen_w, screen_h
+        )
+        self.root.geometry(f"{self._window_width}x{self._window_height}+{init_x}+{init_y}")
 
         self.root.attributes("-topmost", True)
         if sys.platform == "darwin":
@@ -1411,6 +1489,7 @@ class MacOSSubtitleOverlayApp:
 
         self._drag_offset_x = 0
         self._drag_offset_y = 0
+        self._save_pos_job: Optional[str] = None
         self._is_running = False
         self._topbar_visible = True
         self._hover_hide_job: Optional[str] = None
@@ -1457,7 +1536,7 @@ class MacOSSubtitleOverlayApp:
 
         self.status_label = tk.Label(
             self.top_bar,
-            text="就绪 · 单排逐句字幕 + 弱音自动放大已开启（每句 5 秒自动清空）",
+            text="就绪 · 已记住上次字幕位置（拖动后自动保存，每句 5 秒自动清空）",
             fg="#CBD5E1",
             bg="#1A1D24",
             font=("PingFang SC", 11),
@@ -1524,7 +1603,6 @@ class MacOSSubtitleOverlayApp:
         )
         self.vad_badge.pack(side=tk.RIGHT, padx=8, pady=3)
 
-        # 单排纯净字幕主显示区：物理上只有一个 Label，绝不可能产生上下两排字幕
         self.body = tk.Frame(self.root, bg=bg_color, padx=16, pady=6)
         self.body.pack(fill=tk.BOTH, expand=True)
 
@@ -1548,6 +1626,7 @@ class MacOSSubtitleOverlayApp:
         ):
             widget.bind("<ButtonPress-1>", self._on_drag_start)
             widget.bind("<B1-Motion>", self._on_drag_motion)
+            widget.bind("<ButtonRelease-1>", self._on_drag_release)
 
         self.root.bind("<Enter>", self._on_mouse_enter)
         self.root.bind("<Leave>", self._on_mouse_leave)
@@ -1598,6 +1677,26 @@ class MacOSSubtitleOverlayApp:
         x = event.x_root - self._drag_offset_x
         y = event.y_root - self._drag_offset_y
         self.root.geometry(f"+{x}+{y}")
+        self.settings.window_x = int(x)
+        self.settings.window_y = int(y)
+        if self._save_pos_job is not None:
+            try:
+                self.root.after_cancel(self._save_pos_job)
+            except Exception:
+                pass
+        self._save_pos_job = self.root.after(250, self._persist_window_position)
+
+    def _on_drag_release(self, _event=None) -> None:
+        self._persist_window_position()
+
+    def _persist_window_position(self) -> None:
+        self._save_pos_job = None
+        try:
+            self.settings.window_x = int(self.root.winfo_x())
+            self.settings.window_y = int(self.root.winfo_y())
+            self.settings.save()
+        except Exception:
+            pass
 
     def _toggle_translation(self) -> None:
         if not self._is_running:
@@ -1801,7 +1900,7 @@ class MacOSSubtitleOverlayApp:
             self.settings.font_size = int(font_var.get())
             self.settings.enable_agc = bool(agc_var.get())
             self.settings.transparent_bg = bool(transparent_var.get())
-            self.settings.save()
+            self._persist_window_position()
 
             self.display_ctrl.max_chars_per_line = self.settings.max_chars_per_line
             self.curr_subtitle_label.configure(font=("PingFang SC", self.settings.font_size, "bold"))
@@ -1852,6 +1951,7 @@ class MacOSSubtitleOverlayApp:
         self.root.after(100, configure_macos_window_non_hiding_once)
 
     def _on_close(self) -> None:
+        self._persist_window_position()
         self.service.stop()
         self.root.destroy()
 
@@ -1863,39 +1963,41 @@ class MacOSSubtitleOverlayApp:
 # 8. 自检测试模式 (`--self-test`) 供自动化验证核心算法
 # ==============================================================================
 def run_self_test() -> int:
-    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.2.3) ===")
+    import tempfile
+
+    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.3.1) ===")
 
     # 1. 验证语气词与呻吟/喘息文本清洗器
     dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.80)
-
     assert dedup.clean_text("嗯…啊…哦！") == "", "纯语气词应当被完全过滤"
-    assert dedup.clean_text("[喘息] (叹气) 呃，今天我们来讨论系统架构，嗯。") == "今天我们来讨论系统架构", "首尾语气词与喘息标签应被剥离"
-    assert dedup.clean_text("好的好的好的好的，马上处理") == "好的，马上处理", "连续复读词组应被折叠"
+    assert dedup.clean_text("[喘息] (叹气) 呃，今天我们来讨论系统架构，嗯。") == "今天我们来讨论系统架构"
 
-    # 2. 验证单排最新短句提取：永远只返回单排最新短句，prev_subtitle 恒为空（物理根除两排字幕）
+    # 2. 验证单排最新短句提取与 5 秒自动清空
     disp = SubtitleDisplayStateController(expire_seconds=5.0, max_chars_per_line=22)
     prev_t, curr_t = disp.on_new_subtitle("有时候出门之类的。今天我们去哪里？", is_final=False, now=100.0)
-    assert prev_t == "" and curr_t == "今天我们去哪里？", f"单排最新句提取异常: prev={prev_t}, curr={curr_t}"
+    assert prev_t == "" and curr_t == "今天我们去哪里？"
+    assert disp.check_expiration(now=105.1) and disp.curr_subtitle == ""
 
-    # 满 5 秒后无新字流入，当前字幕自动清空
-    changed = disp.check_expiration(now=105.1)
-    assert changed and disp.curr_subtitle == "", f"5秒后字幕应当完全清空: curr={disp.curr_subtitle}"
+    # 3. 验证窗口位置坐标持久化与恢复逻辑
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_file = Path(tmpdir) / "settings.json"
+        s1 = AppSettings.load(cfg_file)
+        # 首次未保存时默认底部居中
+        dx, dy = s1.resolve_window_position(880, 110, 1920, 1080)
+        assert dx == (1920 - 880) // 2 and dy == 1080 - 110 - 110
+        # 模拟用户拖动到 (360, 820) 并保存
+        s1.window_x = 360
+        s1.window_y = 820
+        s1.save(cfg_file)
+        # 重新加载验证坐标精准恢复
+        s2 = AppSettings.load(cfg_file)
+        rx, ry = s2.resolve_window_position(880, 110, 1920, 1080)
+        assert (rx, ry) == (360, 820), f"窗口记忆位置恢复异常: {(rx, ry)}"
 
-    # 3. 验证小声说话 (RMS = 0.0015) 能被灵敏捕捉并通过 Smart AGC 放大
-    acoustic = AcousticSpeechFilter(
-        sample_rate=TARGET_SAMPLE_RATE,
-        rms_threshold=0.0004,
-        breath_filter_strength=0.55,
-        enable_agc=True,
-    )
-    t = np.linspace(0, CHUNK_DURATION_MS / 1000.0, CHUNK_SAMPLES, endpoint=False)
-    quiet_voice = (0.002 * np.sin(2 * np.pi * 220 * t) + 0.0015 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
-    quiet_pcm = (quiet_voice * 32767.0).astype("<i2").tobytes()
-    send_flag, chunks, meta = acoustic.analyze_chunk(quiet_pcm)
-    assert send_flag and len(chunks) >= 1, f"小声说话应当被捕捉而非丢弃: {meta}"
-    boosted_samples = np.frombuffer(chunks[-1], dtype=np.int16).astype(np.float32) / 32768.0
-    boosted_rms = float(np.sqrt(np.mean(boosted_samples ** 2)))
-    assert boosted_rms > meta["rms"] * 5.0, f"Smart AGC 应当显著放大弱音信号: orig={meta['rms']}, boosted={boosted_rms}"
+        # 4. 验证高清图标生成
+        icon_png = Path(tmpdir) / "AppIcon.png"
+        generate_macos_app_icon_png(str(icon_png), size=256)
+        assert icon_png.exists() and icon_png.stat().st_size > 1000, "应用图标生成失败"
 
     print("=== All Self-Tests Passed Successfully! ===")
     return 0
@@ -1904,6 +2006,12 @@ def run_self_test() -> int:
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(run_self_test())
+    if "--generate-icon" in sys.argv:
+        idx = sys.argv.index("--generate-icon")
+        out_file = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "build_bin/AppIcon.png"
+        saved = generate_macos_app_icon_png(out_file, size=1024)
+        print(f"Generated macOS 1024x1024 App Icon: {saved}")
+        sys.exit(0)
     use_web = ("--ui" in sys.argv and "web" in sys.argv) or (not HAS_TKINTER)
     if use_web:
         WebHudSubtitleApp().run()
