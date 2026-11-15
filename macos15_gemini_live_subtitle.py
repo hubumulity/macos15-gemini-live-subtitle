@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.3.2)
+macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.3.3)
 ===========================================================================
 基于 Google Gemini Live API (`gemini-3.5-live-translate-preview`) 构建的桌面级实时字幕工具。
 
@@ -1502,14 +1502,7 @@ class MacOSSubtitleOverlayApp:
         self._window_width = 880
         self._window_height = 110
 
-        # 读取屏幕宽高并恢复上次记忆的窗口坐标 (带多显示器越界安全保护)
-        screen_w = max(800, self.root.winfo_screenwidth())
-        screen_h = max(600, self.root.winfo_screenheight())
-        init_x, init_y = self.settings.resolve_window_position(
-            self._window_width, self._window_height, screen_w, screen_h
-        )
-        self.root.geometry(f"{self._window_width}x{self._window_height}+{init_x}+{init_y}")
-
+        # 关键修复 1：必须先设置 overrideredirect 与 -transparent，再设置 geometry，否则 macOS Aqua Tk 重建 NSWindow 时会丢失坐标！
         self.root.attributes("-topmost", True)
         if sys.platform == "darwin":
             try:
@@ -1517,6 +1510,12 @@ class MacOSSubtitleOverlayApp:
                 self.root.wm_attributes("-transparent", True)
             except tk.TclError:
                 pass
+
+        screen_w = max(800, self.root.winfo_screenwidth())
+        screen_h = max(600, self.root.winfo_screenheight())
+        self._pos_x, self._pos_y = self.settings.resolve_window_position(
+            self._window_width, self._window_height, screen_w, screen_h
+        )
 
         self._drag_offset_x = 0
         self._drag_offset_y = 0
@@ -1528,6 +1527,11 @@ class MacOSSubtitleOverlayApp:
 
         self._build_ui()
         self._apply_bg_colors()
+
+        # 关键修复 2：在控件构建后及窗口映射后多次强制应用记忆坐标，防止 macOS 窗口管理器将无边框窗口重置到默认位置
+        self._apply_saved_geometry()
+        self.root.after(30, self._apply_saved_geometry)
+        self.root.after(180, self._apply_saved_geometry)
 
         self.service = GeminiLiveTranslateService(
             settings=self.settings,
@@ -1650,8 +1654,11 @@ class MacOSSubtitleOverlayApp:
         self.curr_subtitle_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(2, 2))
 
         for widget in (
+            self.root,
             self.top_bar,
+            self.status_dot,
             self.status_label,
+            self.vad_badge,
             self.body,
             self.curr_subtitle_label,
         ):
@@ -1700,31 +1707,44 @@ class MacOSSubtitleOverlayApp:
         if curr_txt != self.curr_subtitle_var.get():
             self.curr_subtitle_var.set(curr_txt)
 
+    def _apply_saved_geometry(self) -> None:
+        try:
+            self.root.geometry(
+                f"{self._window_width}x{self._window_height}+{int(self._pos_x)}+{int(self._pos_y)}"
+            )
+        except Exception:
+            pass
+
     def _on_drag_start(self, event) -> None:
-        self._drag_offset_x = event.x_root - self.root.winfo_x()
-        self._drag_offset_y = event.y_root - self.root.winfo_y()
+        # 关键修复 3：直接使用内部追踪的 _pos_x/_pos_y 计算拖拽偏移，避免 macOS overrideredirect 下 winfo_x() 返回未刷新的旧坐标
+        self._drag_offset_x = int(event.x_root) - int(self._pos_x)
+        self._drag_offset_y = int(event.y_root) - int(self._pos_y)
 
     def _on_drag_motion(self, event) -> None:
-        x = event.x_root - self._drag_offset_x
-        y = event.y_root - self._drag_offset_y
-        self.root.geometry(f"+{x}+{y}")
-        self.settings.window_x = int(x)
-        self.settings.window_y = int(y)
+        x = int(event.x_root) - int(self._drag_offset_x)
+        y = int(event.y_root) - int(self._drag_offset_y)
+        self._pos_x = x
+        self._pos_y = y
+        self.root.geometry(f"{self._window_width}x{self._window_height}+{x}+{y}")
+        self.settings.window_x = x
+        self.settings.window_y = y
         if self._save_pos_job is not None:
             try:
                 self.root.after_cancel(self._save_pos_job)
             except Exception:
                 pass
-        self._save_pos_job = self.root.after(250, self._persist_window_position)
+        self._save_pos_job = self.root.after(200, self._persist_window_position)
 
     def _on_drag_release(self, _event=None) -> None:
         self._persist_window_position()
+        self.status_label.configure(text=f"位置已记住 ({self._pos_x}, {self._pos_y}) · 下次启动将自动固定在此处")
 
     def _persist_window_position(self) -> None:
         self._save_pos_job = None
         try:
-            self.settings.window_x = int(self.root.winfo_x())
-            self.settings.window_y = int(self.root.winfo_y())
+            # 绝不调用 winfo_x()/winfo_y() 覆盖，直接持久化真实拖拽坐标 _pos_x/_pos_y
+            self.settings.window_x = int(self._pos_x)
+            self.settings.window_y = int(self._pos_y)
             self.settings.save()
         except Exception:
             pass
@@ -1996,7 +2016,7 @@ class MacOSSubtitleOverlayApp:
 def run_self_test() -> int:
     import tempfile
 
-    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.3.2) ===")
+    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.3.3) ===")
 
     # 1. 验证语气词与呻吟/喘息文本清洗器
     dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.80)
