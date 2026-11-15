@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.3.1)
+macOS 15 (Sequoia) Gemini 3.5 Live Translate 实时系统音频中文字幕软件 (v1.3.2)
 ===========================================================================
 基于 Google Gemini Live API (`gemini-3.5-live-translate-preview`) 构建的桌面级实时字幕工具。
 
@@ -119,87 +119,118 @@ MAX_CHARS_PER_LINE = 24
 # ==============================================================================
 def generate_macos_app_icon_png(output_path: str, size: int = 1024) -> str:
     """
-    采用 2x 超采样抗锯齿 (Supersampling LANCZOS) 渲染极简 Apple Design 风格 macOS 15 图标：
-    - 曜石黑与深空钛灰微光渐变圆角底座 (无任何杂乱文字或伪字符)；
-    - 中心悬浮暖珀金到珍珠白的立体流线声波雕塑与极简双层玻璃字幕光条。
+    零第三方图像库依赖 (仅使用内置 struct + zlib + numpy，无需安装 PIL/Pillow)：
+    渲染 macOS 15 极简工业设计风格 3D 图标（拉丝钛金属边框 + 哑光曜石黑底座 + 暖珀金与珍珠白磨砂玻璃流体声波雕塑）。
     """
-    from PIL import Image, ImageDraw, ImageFilter
+    import struct
+    import zlib
 
-    ss = 2
-    W = size * ss
-    img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    H = W = int(size)
+    y, x = np.ogrid[0:H, 0:W]
+    nx = (x.astype(np.float32) / (W - 1)) * 2.0 - 1.0
+    ny = (y.astype(np.float32) / (H - 1)) * 2.0 - 1.0
 
-    # 1. 曜石黑 + 深空钛灰径向高质感底色
-    y_grid, x_grid = np.mgrid[0:W, 0:W].astype(np.float32) / float(W)
-    dist = np.sqrt((x_grid - 0.5) ** 2 + (y_grid - 0.32) ** 2)
-    r = np.clip(38 - 22 * dist + 14 * (1.0 - y_grid), 12, 60)
-    g = np.clip(40 - 22 * dist + 16 * (1.0 - y_grid), 14, 64)
-    b = np.clip(48 - 20 * dist + 24 * (1.0 - y_grid), 18, 78)
-    a = np.full((W, W), 255, dtype=np.uint8)
-    bg_arr = np.stack([r.astype(np.uint8), g.astype(np.uint8), b.astype(np.uint8), a], axis=-1)
-    bg_img = Image.fromarray(bg_arr, mode="RGBA")
+    # 1. 计算 macOS 圆角矩形 (Squircle) 距离场
+    ax = np.abs(nx) / 0.84
+    ay = np.abs(ny) / 0.84
+    sq_dist = (ax ** 4.8 + ay ** 4.8) ** (1.0 / 4.8)
+    aa_width = 2.2 / W
+    outer_alpha = np.clip((1.0 - sq_dist) / aa_width, 0.0, 1.0)
 
-    pad = int(W * 0.085)
-    corner_r = int(W * 0.215)
-    mask = Image.new("L", (W, W), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([pad, pad, W - pad, W - pad], radius=corner_r, fill=255)
-    img.paste(bg_img, (0, 0), mask)
+    # 内部曜石黑面板边界
+    in_ax = np.abs(nx) / 0.755
+    in_ay = np.abs(ny) / 0.755
+    in_dist = (in_ax ** 4.8 + in_ay ** 4.8) ** (1.0 / 4.8)
+    inner_mask = np.clip((1.0 - in_dist) / aa_width, 0.0, 1.0)
+    rim_mask = np.clip(outer_alpha - inner_mask, 0.0, 1.0)
 
-    # 2. 中心暖珀金柔光氛围层
-    glow = Image.new("RGBA", (W, W), (0, 0, 0, 0))
-    gdraw = ImageDraw.Draw(glow, "RGBA")
-    cx, cy = W // 2, int(W * 0.46)
-    gdraw.ellipse([cx - int(W * 0.28), cy - int(W * 0.22), cx + int(W * 0.28), cy + int(W * 0.22)], fill=(251, 146, 60, 75))
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=int(W * 0.07)))
-    img = Image.alpha_composite(img, glow)
+    # 拉丝钛金属边框着色 (左上高光，右下深邃)
+    light_dir = np.clip(1.0 - 0.45 * (nx + ny), 0.35, 1.25)
+    brush_noise = 0.03 * np.sin(ny * 260.0 + nx * 40.0)
+    rim_luma = np.clip((138.0 * light_dir + 25.0 * brush_noise), 55.0, 210.0)
+    rim_r = rim_luma * 1.02
+    rim_g = rim_luma * 1.00
+    rim_b = rim_luma * 0.97
 
-    draw = ImageDraw.Draw(img, "RGBA")
-    # 钛金属细腻高光内描边
-    draw.rounded_rectangle(
-        [pad + 2, pad + 2, W - pad - 2, W - pad - 2],
-        radius=corner_r - 2,
-        outline=(255, 255, 255, 52),
-        width=max(2, W // 220),
+    # 哑光曜石黑内面板着色
+    rad = np.sqrt(nx ** 2 + (ny + 0.15) ** 2)
+    base_r = np.clip(32.0 - 14.0 * rad, 14.0, 36.0)
+    base_g = np.clip(33.0 - 14.0 * rad, 15.0, 38.0)
+    base_b = np.clip(37.0 - 14.0 * rad, 18.0, 42.0)
+
+    img_r = base_r * inner_mask + rim_r * rim_mask
+    img_g = base_g * inner_mask + rim_g * rim_mask
+    img_b = base_b * inner_mask + rim_b * rim_mask
+
+    # 2. 3D 暖珀金与珍珠白磨砂玻璃流体声波雕塑 (限制在 [-0.58, 0.58] 区间)
+    wx = np.clip(nx / 0.58, -1.2, 1.2)
+    env = np.exp(-2.8 * (wx ** 2)) * np.clip(1.0 - (wx ** 2), 0.0, 1.0) ** 1.4
+
+    # 暖珀金波浪丝带 (Amber Ribbon)
+    y_amber = (0.28 * np.sin(4.6 * wx + 0.35) - 0.10 * np.cos(2.3 * wx)) * env
+    thick_amber = (0.125 * env + 0.012) * (1.0 + 0.25 * np.cos(4.6 * wx))
+    d_amber = np.abs(ny - y_amber) / (thick_amber + 1e-5)
+    mask_amber = np.clip((1.0 - d_amber) * 10.0, 0.0, 1.0) * (np.abs(wx) < 1.0)
+    ridge_amber = np.clip(1.0 - (d_amber ** 1.6), 0.0, 1.0)
+    top_light_a = np.clip(0.65 - (ny - y_amber) / (thick_amber + 1e-5) * 0.5, 0.2, 1.1)
+
+    # 珍珠白磨砂波浪丝带 (Pearl Frosted Ribbon)
+    y_pearl = (-0.34 * np.sin(4.2 * wx - 0.55) + 0.12 * np.sin(2.1 * wx + 0.8)) * env
+    thick_pearl = (0.145 * env + 0.014) * (1.0 + 0.2 * np.sin(4.2 * wx))
+    d_pearl = np.abs(ny - y_pearl) / (thick_pearl + 1e-5)
+    mask_pearl = np.clip((1.0 - d_pearl) * 10.0, 0.0, 1.0) * (np.abs(wx) < 1.0)
+    ridge_pearl = np.clip(1.0 - (d_pearl ** 1.5), 0.0, 1.0)
+    top_light_p = np.clip(0.75 - (ny - y_pearl) / (thick_pearl + 1e-5) * 0.45, 0.3, 1.15)
+
+    # 底部柔和投影与中心暖金环境辉光
+    glow = np.exp(-5.5 * (nx ** 2 + (ny - 0.04) ** 2)) * inner_mask
+    img_r += 48.0 * glow
+    img_g += 24.0 * glow
+    img_b += 6.0 * glow
+
+    # 叠印暖珀金丝带
+    ar = (235.0 * ridge_amber * top_light_a + 180.0 * (1.0 - ridge_amber))
+    ag = (135.0 * ridge_amber * top_light_a + 75.0 * (1.0 - ridge_amber))
+    ab = (38.0 * ridge_amber * top_light_a + 18.0 * (1.0 - ridge_amber))
+    alpha_a = mask_amber * 0.90 * inner_mask
+    img_r = img_r * (1.0 - alpha_a) + ar * alpha_a
+    img_g = img_g * (1.0 - alpha_a) + ag * alpha_a
+    img_b = img_b * (1.0 - alpha_a) + ab * alpha_a
+
+    # 叠印珍珠白磨砂丝带 (带透射暖金次表面散射)
+    overlap_warmth = mask_amber * 0.42
+    pr = (242.0 * ridge_pearl * top_light_p + 185.0 * (1.0 - ridge_pearl)) + 25.0 * overlap_warmth
+    pg = (236.0 * ridge_pearl * top_light_p + 175.0 * (1.0 - ridge_pearl)) - 10.0 * overlap_warmth
+    pb = (232.0 * ridge_pearl * top_light_p + 170.0 * (1.0 - ridge_pearl)) - 45.0 * overlap_warmth
+    alpha_p = mask_pearl * 0.86 * inner_mask
+    img_r = img_r * (1.0 - alpha_p) + pr * alpha_p
+    img_g = img_g * (1.0 - alpha_p) + pg * alpha_p
+    img_b = img_b * (1.0 - alpha_p) + pb * alpha_p
+
+    rgba = np.zeros((H, W, 4), dtype=np.uint8)
+    rgba[..., 0] = np.clip(img_r, 0, 255).astype(np.uint8)
+    rgba[..., 1] = np.clip(img_g, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(img_b, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip(outer_alpha * 255.0, 0, 255).astype(np.uint8)
+
+    # 3. 使用标准库 struct + zlib 直接编码输出 PNG，零 PIL 依赖
+    raw_scanlines = b"".join(b"\x00" + rgba[row].tobytes() for row in range(H))
+
+    def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+        return struct.pack("!I", len(data)) + chunk_type + data + struct.pack("!I", crc)
+
+    ihdr = struct.pack("!IIBBBBB", W, H, 8, 6, 0, 0, 0)
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(raw_scanlines, level=6))
+        + _png_chunk(b"IEND", b"")
     )
 
-    # 3. 极简 7 柱黄金比例立体声波胶囊 (珍珠白 + 暖珀橙渐变)
-    heights = [0.11, 0.21, 0.34, 0.44, 0.34, 0.21, 0.11]
-    palette = [
-        (251, 146, 60, 235),
-        (253, 186, 116, 245),
-        (254, 215, 170, 252),
-        (255, 255, 255, 255),
-        (254, 215, 170, 252),
-        (253, 186, 116, 245),
-        (251, 146, 60, 235),
-    ]
-    bar_w = int(W * 0.052)
-    gap = int(W * 0.032)
-    total_w = len(heights) * bar_w + (len(heights) - 1) * gap
-    sx = cx - total_w // 2
-
-    for i, (h_ratio, col) in enumerate(zip(heights, palette)):
-        bx0 = sx + i * (bar_w + gap)
-        bx1 = bx0 + bar_w
-        hh = int(W * h_ratio * 0.5)
-        by0 = cy - hh
-        by1 = cy + hh
-        draw.rounded_rectangle([bx0, by0, bx1, by1], radius=bar_w // 2, fill=col)
-
-    # 4. 底部极简悬浮毛玻璃字幕光条 (无任何文字，纯几何美学)
-    bar_y = int(W * 0.74)
-    bar_h = int(W * 0.044)
-    bar_half_w = int(W * 0.23)
-    draw.rounded_rectangle(
-        [cx - bar_half_w, bar_y - bar_h // 2, cx + bar_half_w, bar_y + bar_h // 2],
-        radius=bar_h // 2,
-        fill=(255, 255, 255, 235),
-    )
-
-    final_img = img.resize((size, size), resample=Image.Resampling.LANCZOS)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    final_img.save(out, format="PNG")
+    out.write_bytes(png_bytes)
     return str(out.resolve())
 
 
@@ -1965,7 +1996,7 @@ class MacOSSubtitleOverlayApp:
 def run_self_test() -> int:
     import tempfile
 
-    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.3.1) ===")
+    print("=== Running macOS 15 Gemini 3.5 Live Subtitle Engine Self-Test (v1.3.2) ===")
 
     # 1. 验证语气词与呻吟/喘息文本清洗器
     dedup = SubtitleCleanerAndDeduplicator(similarity_threshold=0.80)
